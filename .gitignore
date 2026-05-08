@@ -1,0 +1,17 @@
+# Runtime data — credentials, exports, lock file
+data/
+confluence-lock.json
+
+# Environment
+.env
+
+# Local Python venv
+.cme/
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local TLS material
+certs/

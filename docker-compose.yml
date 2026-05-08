@@ -1,0 +1,19 @@
+services:
+  cme-mcp:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # MCP bearer token — injecter depuis le shell : export MCP_AUTH_TOKEN=...
+      - MCP_AUTH_TOKEN
+      # Répertoire de sortie des exports CME dans le container
+      - CME_EXPORT__OUTPUT_PATH=/data/exports
+      # HTTPS — décommenter et fournir les fichiers dans ./certs/
+      #- MCP_SSL_CERTFILE=/certs/server.crt
+      #- MCP_SSL_KEYFILE=/certs/server.key
+    volumes:
+      # État runtime : credentials, manifest, lock, exports
+      - ./data:/data
+      # Certificats HTTPS — décommenter si MCP_SSL_CERTFILE est renseigné
+      #- ./certs:/certs:ro
+    restart: unless-stopped
