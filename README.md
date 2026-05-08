@@ -12,8 +12,7 @@ Orchestrating agent (Claude or other)
         │
         ├── /data/cme/app_data.json   ← CME credentials + connection settings (persistent)
         ├── /data/sources-manifest.yaml ← export sources managed by agent (persistent)
-        ├── /data/confluence-lock.json  ← CME lock file (persistent)
-        └── /data/exports/            ← exported markdown files (persistent)
+        └── /data/exports/            ← exported markdown files + CME lock file (persistent)
 ```
 
 All runtime state lives in `./data/` on the host, mounted as a Docker volume.
@@ -36,6 +35,8 @@ docker compose up --build
 ```
 
 The server starts on `http://localhost:8080/sse`.
+If `MCP_AUTH_TOKEN` is set, MCP clients must send
+`Authorization: Bearer your_secret_token`.
 
 ---
 
@@ -47,9 +48,10 @@ After that, the server is fully autonomous across restarts.
 ```
 1. cme_status          → "not_configured — call cme_setup"
 2. cme_setup(...)      → credentials + connection settings written to /data/cme/app_data.json
-3. cme_source_add(...) → source added to /data/sources-manifest.yaml
-4. cme_export_run(...) → async export started, returns job_id
-5. cme_export_status(job_id=...) → monitor progress
+3. cme_sources_list()  → inspect seeded sources from /data/sources-manifest.yaml
+4. cme_source_add(...) → add/update sources if needed
+5. cme_export_run(...) → async export started, returns job_id
+6. cme_export_status(job_id=...) → monitor progress
 ```
 
 On subsequent restarts: `cme_status` returns `configured` and the agent skips straight to step 3+.
@@ -78,6 +80,10 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | `api_token` | string | no | API token (Atlassian Cloud) |
 | `verify_ssl` | boolean | no | Verify SSL certificates (default: `true`) |
 | `use_v2_api` | boolean | no | Use REST API v2 — Data Center 8+ or Cloud (default: `false`) |
+
+Provide either `pat` for self-hosted Confluence, or `username` + `api_token`
+for Atlassian Cloud. `base_url` alone stores connection settings but does not
+make `cme_status` return `configured`.
 
 ### `cme_source_add`
 
@@ -120,7 +126,7 @@ The server refuses to start if only one of the two SSL variables is set, or if a
 
 ### Claude Code (`.mcp.json`)
 
-HTTP (default):
+HTTP without bearer token:
 ```json
 {
   "mcpServers": {
@@ -131,12 +137,12 @@ HTTP (default):
 }
 ```
 
-HTTPS with bearer token:
+HTTP/HTTPS with bearer token:
 ```json
 {
   "mcpServers": {
     "cme": {
-      "url": "https://your-host:8080/sse",
+      "url": "http://localhost:8080/sse",
       "headers": {
         "Authorization": "Bearer your_secret_token"
       }
@@ -157,13 +163,17 @@ Auth header  :  Authorization: Bearer <MCP_AUTH_TOKEN>   (if token is set)
 
 ## Local development (without Docker)
 
-The server auto-detects the local CME venv at `.cme/`:
+The server auto-detects the local CME venv at `.cme/`. Install both CME and the
+MCP HTTP server dependencies in that venv:
 
 ```bash
 cd AgentCME
+python3.11 -m venv .cme
+.cme/bin/pip install --upgrade pip
+.cme/bin/pip install confluence-markdown-exporter mcp starlette uvicorn sse-starlette pyyaml
 .cme/bin/python cme_mcp_server.py
 # Starts on http://0.0.0.0:8080/sse
-# CME_DATA_DIR defaults to AgentCME/ (manifest + lock next to the script)
+# CME_DATA_DIR defaults to AgentCME/
 ```
 
 CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not set:
