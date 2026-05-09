@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     uvicorn \
     pyyaml
 
-COPY cme_mcp_server.py sources-manifest.yaml .
+COPY cme_mcp_server.py .
 
 ENV CME_DATA_DIR=/data
 ENV CME_CONFIG_PATH=/data/cme/app_data.json

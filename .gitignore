@@ -1,6 +1,7 @@
 # Runtime data — credentials, exports, lock file
 data/
 confluence-lock.json
+sources-manifest.yaml
 
 # Environment
 .env

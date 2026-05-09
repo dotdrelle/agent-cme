@@ -1,5 +1,7 @@
 # AgentCME — Agentic Confluence Markdown Exporter
 
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
 ## Architecture
@@ -16,10 +18,9 @@ Orchestrating agent (Claude or other)
 ```
 
 All runtime state lives in `./data/` on the host, mounted as a Docker volume.
-The versioned `sources-manifest.yaml` at the project root is used only as the
-initial seed: on first startup it is copied to `./data/sources-manifest.yaml` if
-that runtime file does not already exist. MCP edits are then persisted in
-`./data/sources-manifest.yaml` and are not overwritten on later restarts.
+No export source is versioned in Git. On first startup, AgentCME creates an empty
+runtime manifest at `./data/sources-manifest.yaml` if it does not already exist.
+MCP edits are persisted there and are not overwritten on later restarts.
 
 ---
 
@@ -48,7 +49,7 @@ After that, the server is fully autonomous across restarts.
 ```
 1. cme_status          → "not_configured — call cme_setup"
 2. cme_setup(...)      → credentials + connection settings written to /data/cme/app_data.json
-3. cme_sources_list()  → inspect seeded sources from /data/sources-manifest.yaml
+3. cme_sources_list()  → inspect runtime sources from /data/sources-manifest.yaml
 4. cme_source_add(...) → add/update sources if needed
 5. cme_export_run(...) → async export started, returns job_id
 6. cme_export_status(job_id=...) → monitor progress
@@ -229,9 +230,16 @@ CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not se
 AgentCME/data/               ← mounted at /data in the container
 ├── cme/
 │   └── app_data.json        ← CME credentials + settings (written by cme_setup)
-├── sources-manifest.yaml    ← export sources (seeded once, then managed by agent)
+├── sources-manifest.yaml    ← runtime export sources (created empty, then managed by agent)
 └── exports/                 ← exported markdown files
     └── confluence-lock.json ← CME lock file (written by CME during export)
 ```
 
 `data/` is gitignored — it contains credentials and generated content.
+
+---
+
+## License
+
+AgentCME is licensed under the same license as `llm-wiki`:
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).

@@ -45,7 +45,6 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _MANIFEST = _DATA_DIR / "sources-manifest.yaml"
-_SEED_MANIFEST = Path(__file__).parent / "sources-manifest.yaml"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -193,11 +192,10 @@ def _save_manifest(data: dict) -> None:
 
 
 def _init_manifest_if_missing() -> None:
-    """Seed the writable runtime manifest once, without overwriting MCP edits."""
-    if _MANIFEST.exists() or not _SEED_MANIFEST.exists() or _MANIFEST == _SEED_MANIFEST:
+    """Create the writable runtime manifest once, without versioned source data."""
+    if _MANIFEST.exists():
         return
-    _MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    _MANIFEST.write_text(_SEED_MANIFEST.read_text(encoding="utf-8"), encoding="utf-8")
+    _save_manifest({"exports": []})
 
 
 def _source_url(source: dict) -> str:
