@@ -4,7 +4,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # MCP bearer token — injecter depuis le shell : export MCP_AUTH_TOKEN=...
+      # Optional MCP bearer token. Leave unset for no auth.
       - MCP_AUTH_TOKEN
       # Répertoire de sortie des exports CME dans le container
       - CME_EXPORT__OUTPUT_PATH=/data/exports

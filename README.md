@@ -1,12 +1,12 @@
 # AgentCME — Agentic Confluence Markdown Exporter
 
-MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports — all over HTTP/SSE.
+MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
 ## Architecture
 
 ```
 Orchestrating agent (Claude or other)
-        │  MCP over HTTP/SSE
+        │  MCP Streamable HTTP
         ▼
   AgentCME MCP server  (port 8080)
         │
@@ -28,15 +28,15 @@ that runtime file does not already exist. MCP edits are then persisted in
 ```bash
 cd AgentCME
 
-# Inject the MCP bearer token from your shell (never written to a file)
-export MCP_AUTH_TOKEN=your_secret_token
-
 docker compose up --build
 ```
 
-The server starts on `http://localhost:8080/sse`.
-If `MCP_AUTH_TOKEN` is set, MCP clients must send
-`Authorization: Bearer your_secret_token`.
+The MCP endpoint starts on `http://localhost:8080/mcp/`.
+Opening that URL in a browser shows a status page. MCP clients use the same URL
+for Streamable HTTP requests.
+
+Authentication is disabled by default. If you set `MCP_AUTH_TOKEN`, clients must
+send `Authorization: Bearer your_secret_token`.
 
 ---
 
@@ -52,6 +52,7 @@ After that, the server is fully autonomous across restarts.
 4. cme_source_add(...) → add/update sources if needed
 5. cme_export_run(...) → async export started, returns job_id
 6. cme_export_status(job_id=...) → monitor progress
+7. cme_export_cancel(job_id=...) → cancel a running export when needed
 ```
 
 On subsequent restarts: `cme_status` returns `configured` and the agent skips straight to step 3+.
@@ -68,6 +69,7 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | `cme_source_add` | Add or update an export source (space or page). |
 | `cme_source_remove` | Remove an export source by name. |
 | `cme_export_run` | Start an async export. Returns a `job_id`. |
+| `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
 | `cme_export_status` | Check job progress, or show last-export summary. |
 
 ### `cme_setup`
@@ -124,25 +126,49 @@ The server refuses to start if only one of the two SSL variables is set, or if a
 
 ## Connecting MCP clients
 
+With Docker Compose:
+
+```bash
+cd AgentCME
+docker compose up --build
+```
+
+### Claude Code
+
+```bash
+claude mcp add --transport http cme http://localhost:8080/mcp/
+```
+
+If `MCP_AUTH_TOKEN` is set:
+
+```bash
+claude mcp add --transport http cme http://localhost:8080/mcp/ \
+  --header "Authorization: Bearer your_secret_token"
+```
+
 ### Claude Code (`.mcp.json`)
 
-HTTP without bearer token:
+Without token:
+
 ```json
 {
   "mcpServers": {
     "cme": {
-      "url": "http://localhost:8080/sse"
+      "type": "http",
+      "url": "http://localhost:8080/mcp/"
     }
   }
 }
 ```
 
-HTTP/HTTPS with bearer token:
+With token:
+
 ```json
 {
   "mcpServers": {
     "cme": {
-      "url": "http://localhost:8080/sse",
+      "type": "http",
+      "url": "http://localhost:8080/mcp/",
       "headers": {
         "Authorization": "Bearer your_secret_token"
       }
@@ -151,12 +177,27 @@ HTTP/HTTPS with bearer token:
 }
 ```
 
-### Generic SSE MCP client
+### OpenWebUI
+
+Register AgentCME as an MCP server:
 
 ```
-SSE endpoint :  GET  http(s)://host:8080/sse
-Message POST :  POST http(s)://host:8080/messages/?session_id=<id>
-Auth header  :  Authorization: Bearer <MCP_AUTH_TOKEN>   (if token is set)
+Type: MCP (Streamable HTTP)
+URL:  http://localhost:8080/mcp/
+Auth: None
+```
+
+If OpenWebUI itself runs in Docker, `localhost` means the OpenWebUI container,
+not your host. Use one of these instead:
+
+```
+http://host.docker.internal:8080/mcp/
+```
+
+or, if OpenWebUI is on the same Compose network:
+
+```
+http://cme-mcp:8080/mcp/
 ```
 
 ---
@@ -170,9 +211,9 @@ MCP HTTP server dependencies in that venv:
 cd AgentCME
 python3.11 -m venv .cme
 .cme/bin/pip install --upgrade pip
-.cme/bin/pip install confluence-markdown-exporter mcp starlette uvicorn sse-starlette pyyaml
+.cme/bin/pip install confluence-markdown-exporter "mcp>=1.9.4" starlette uvicorn pyyaml
 .cme/bin/python cme_mcp_server.py
-# Starts on http://0.0.0.0:8080/sse
+# Starts on http://0.0.0.0:8080/mcp/
 # CME_DATA_DIR defaults to AgentCME/
 ```
 

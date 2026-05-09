@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""CME MCP Server — HTTP/SSE transport for container deployment."""
+"""CME MCP Server — Streamable HTTP transport for container deployment."""
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
+import time
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,14 +20,16 @@ if _CME_SITE.exists():
 
 import yaml
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
-from starlette.routing import Mount, Route
+from starlette.responses import HTMLResponse, PlainTextResponse
+from starlette.routing import Mount
+from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from confluence_markdown_exporter.utils.app_data_store import (
@@ -53,7 +58,7 @@ app = Server("cme")
 
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 if not _MCP_TOKEN:
-    print("[cme-mcp] WARNING: MCP_AUTH_TOKEN is not set — server is open to all connections")
+    print("[cme-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -68,6 +73,95 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _escape_html(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _wants_html(request: Request) -> bool:
+    accept = request.headers.get("accept", "")
+    return "text/html" in accept
+
+
+def _render_landing_page(endpoint_url: str, scheme: str) -> str:
+    auth_status = (
+        "Bearer token required"
+        if _MCP_TOKEN
+        else "Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients."
+    )
+    tool_names = [
+        ("cme_status", "Check AgentCME runtime configuration and readiness."),
+        ("cme_setup", "Store AgentCME Confluence credentials and connection settings."),
+        ("cme_sources_list", "List AgentCME configured Confluence export sources."),
+        ("cme_source_add", "Add or update a Confluence export source."),
+        ("cme_source_remove", "Remove an export source by name."),
+        ("cme_export_run", "Start an asynchronous markdown export."),
+        ("cme_export_cancel", "Cancel a running AgentCME export job."),
+        ("cme_export_status", "Check export progress or last-export summary."),
+    ]
+    tools = "\n".join(
+        f"<li><code>{_escape_html(name)}</code><span>{_escape_html(description)}</span></li>"
+        for name, description in tool_names
+    )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCME MCP connector</title>
+  <style>
+    :root {{ color-scheme: light dark; --bg: #f8fafc; --panel: #ffffff; --text: #111827; --muted: #64748b; --line: #d8dee8; --accent: #2563eb; --code: #eef2ff; }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0f172a; --panel: #111827; --text: #f8fafc; --muted: #94a3b8; --line: #253044; --accent: #60a5fa; --code: #1e293b; }} }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0; }}
+    .eyebrow {{ color: var(--accent); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; font-size: 12px; }}
+    h1 {{ margin: 8px 0 10px; font-size: clamp(32px, 6vw, 52px); line-height: 1.05; letter-spacing: 0; }}
+    h2 {{ margin: 0 0 16px; font-size: 20px; letter-spacing: 0; }}
+    .lead {{ margin: 0 0 28px; color: var(--muted); max-width: 720px; font-size: 17px; }}
+    .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 22px; margin: 18px 0; }}
+    dl {{ display: grid; grid-template-columns: 150px 1fr; gap: 10px 18px; margin: 0; }}
+    dt {{ color: var(--muted); }}
+    dd {{ margin: 0; min-width: 0; overflow-wrap: anywhere; }}
+    code {{ background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; }}
+    ul {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }}
+    li {{ display: grid; grid-template-columns: minmax(170px, 240px) 1fr; gap: 14px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }}
+    li:first-child {{ border-top: 0; padding-top: 0; }}
+    li span {{ color: var(--muted); }}
+    .note {{ color: var(--muted); margin: 12px 0 0; }}
+    @media (max-width: 640px) {{ dl, li {{ grid-template-columns: 1fr; }} main {{ padding: 32px 0; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">MCP Streamable HTTP</div>
+    <h1>AgentCME MCP connector</h1>
+    <p class="lead">This endpoint is intended for MCP clients such as Claude and OpenWebUI. Browsers can view this status page; MCP clients should send Streamable HTTP requests to the same URL.</p>
+    <section class="panel">
+      <dl>
+        <dt>Status</dt><dd>Ready</dd>
+        <dt>Endpoint</dt><dd><code>{_escape_html(endpoint_url)}</code></dd>
+        <dt>Transport</dt><dd>MCP Streamable HTTP over {_escape_html(scheme.upper())}</dd>
+        <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
+        <dt>Data directory</dt><dd><code>{_escape_html(str(_DATA_DIR))}</code></dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <h2>Available tools</h2>
+      <ul>{tools}</ul>
+      <p class="note">First-run workflow: call <code>cme_status</code>, then <code>cme_setup</code> if credentials are not configured. Export jobs can be cancelled with <code>cme_export_cancel</code>; files already written before cancellation are left in place.</p>
+    </section>
+  </main>
+</body>
+</html>"""
+
 
 def _mask_secrets(data: Any) -> Any:
     if isinstance(data, dict):
@@ -134,7 +228,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_status",
             description=(
-                "Check if CME is configured and ready. "
+                "Check AgentCME runtime configuration and readiness. "
+                "Use this for questions about the AgentCME agent/server config, Confluence credentials, SSL/API mode, or last export state. "
+                "Do not use wiki tools for live AgentCME configuration. "
                 "Call this first — returns 'configured' or 'not_configured'. "
                 "If not_configured, call cme_setup before doing anything else."
             ),
@@ -143,7 +239,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_setup",
             description=(
-                "One-time CME initialization: stores Confluence credentials and connection settings persistently. "
+                "One-time AgentCME initialization: stores Confluence credentials and connection settings persistently. "
+                "Use this only to configure the live AgentCME Confluence exporter, not to edit llm-wiki markdown pages. "
                 "After setup the server is autonomous — no reconfiguration needed on restart. "
                 "Provide pat (self-hosted PAT) or username+api_token (Atlassian Cloud)."
             ),
@@ -162,13 +259,18 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cme_sources_list",
-            description="List all configured export sources from the manifest.",
+            description=(
+                "List AgentCME configured Confluence export sources from the live manifest. "
+                "Use this for questions about which Confluence spaces/pages the AgentCME agent exports. "
+                "Do not use llm-wiki source listing tools for this runtime manifest."
+            ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         Tool(
             name="cme_source_add",
             description=(
-                "Add or update an export source in the manifest. "
+                "Add or update an AgentCME Confluence export source in the live manifest. "
+                "Use this to configure what AgentCME exports, not to ingest or edit llm-wiki content. "
                 "For type=space: provide base_url + space key. "
                 "For type=page: provide url (full Confluence page URL)."
             ),
@@ -187,7 +289,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cme_source_remove",
-            description="Remove an export source from the manifest by name.",
+            description=(
+                "Remove an AgentCME Confluence export source from the live manifest by name. "
+                "Use this for AgentCME export configuration only."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -199,7 +304,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_export_run",
             description=(
-                "Start an asynchronous export for one or all sources. "
+                "Start an asynchronous AgentCME Confluence-to-Markdown export for one or all configured sources. "
+                "Use this when the user asks AgentCME to run or refresh an export. "
+                "Use cme_export_cancel(job_id=...) to request cancellation of a running export; files already written before cancellation are left in place. "
+                "If the export fails during the initial Confluence preflight request, such as /rest/api/space?limit=1, no markdown export files have been written yet. "
                 "Returns a job_id immediately. Use cme_export_status(job_id=...) to follow progress."
             ),
             inputSchema={
@@ -211,8 +319,26 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="cme_export_cancel",
+            description=(
+                "Cancel a running AgentCME export job by job_id. "
+                "This terminates the active cme subprocess when possible and marks the job cancelled. "
+                "It does not delete files already written before cancellation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Job ID returned by cme_export_run."},
+                },
+                "required": ["job_id"],
+            },
+        ),
+        Tool(
             name="cme_export_status",
-            description="Check status of an export job, or return lock file summary if no job_id given.",
+            description=(
+                "Check AgentCME export job status, or return export lock/state summary if no job_id is given. "
+                "Use this for live export progress and recent AgentCME export state."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -230,23 +356,36 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    match name:
-        case "cme_status":
-            return await _tool_status()
-        case "cme_setup":
-            return await _tool_setup(arguments)
-        case "cme_sources_list":
-            return await _tool_sources_list()
-        case "cme_source_add":
-            return await _tool_source_add(arguments)
-        case "cme_source_remove":
-            return await _tool_source_remove(arguments)
-        case "cme_export_run":
-            return await _tool_export_run(arguments)
-        case "cme_export_status":
-            return await _tool_export_status(arguments)
-        case _:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    start = time.perf_counter()
+    print(f"[cme-mcp] tools/call {name}")
+    try:
+        match name:
+            case "cme_status":
+                result = await _tool_status()
+            case "cme_setup":
+                result = await _tool_setup(arguments)
+            case "cme_sources_list":
+                result = await _tool_sources_list()
+            case "cme_source_add":
+                result = await _tool_source_add(arguments)
+            case "cme_source_remove":
+                result = await _tool_source_remove(arguments)
+            case "cme_export_run":
+                result = await _tool_export_run(arguments)
+            case "cme_export_cancel":
+                result = await _tool_export_cancel(arguments)
+            case "cme_export_status":
+                result = await _tool_export_status(arguments)
+            case _:
+                result = [TextContent(type="text", text=f"Unknown tool: {name}")]
+        elapsed_ms = round((time.perf_counter() - start) * 1000)
+        status = "error" if any(item.text.startswith(("Error:", "Unknown tool:")) for item in result) else "ok"
+        print(f"[cme-mcp] tools/result {name} {status} {elapsed_ms}ms")
+        return result
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000)
+        print(f"[cme-mcp] tools/result {name} exception {elapsed_ms}ms {exc}")
+        raise
 
 
 async def _tool_status() -> list[TextContent]:
@@ -379,6 +518,8 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "stdout": [],
         "stderr": [],
         "returncode": None,
+        "process": None,
+        "task": None,
     }
 
     async def _run_cmd(cmd: list[str]) -> int:
@@ -388,15 +529,32 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(_DATA_DIR),
         )
+        _jobs[job_id]["process"] = proc
         async def _read(stream: asyncio.StreamReader, buf: list) -> None:
             async for line in stream:
                 buf.append(line.decode(errors="replace").rstrip())
-        await asyncio.gather(
-            _read(proc.stdout, _jobs[job_id]["stdout"]),
-            _read(proc.stderr, _jobs[job_id]["stderr"]),
-        )
-        await proc.wait()
-        return proc.returncode
+        stdout_task = asyncio.create_task(_read(proc.stdout, _jobs[job_id]["stdout"]))
+        stderr_task = asyncio.create_task(_read(proc.stderr, _jobs[job_id]["stderr"]))
+        wait_task = asyncio.create_task(proc.wait())
+        try:
+            await asyncio.gather(stdout_task, stderr_task, wait_task)
+            return proc.returncode
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            raise
+        finally:
+            for task in (stdout_task, stderr_task, wait_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, wait_task, return_exceptions=True)
+            if _jobs[job_id].get("process") is proc:
+                _jobs[job_id]["process"] = None
 
     async def _run() -> None:
         _jobs[job_id]["status"] = "running"
@@ -409,14 +567,48 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
             _jobs[job_id]["returncode"] = rc
             _jobs[job_id]["status"] = "success" if rc == 0 else "failed"
             _jobs[job_id]["finished_at"] = datetime.now().isoformat()
+        except asyncio.CancelledError:
+            _jobs[job_id]["status"] = "cancelled"
+            _jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            _jobs[job_id]["error"] = "Export cancelled by cme_export_cancel."
         except Exception as e:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = str(e)
+            _jobs[job_id]["finished_at"] = datetime.now().isoformat()
 
-    asyncio.create_task(_run())
+    _jobs[job_id]["task"] = asyncio.create_task(_run())
     return [TextContent(
         type="text",
-        text=f"Export started — job_id: {job_id}\nSources: {', '.join(s['name'] for s in sources)}\nUse cme_export_status(job_id='{job_id}') to follow progress.",
+        text=f"Export started — job_id: {job_id}\nSources: {', '.join(s['name'] for s in sources)}\nUse cme_export_status(job_id='{job_id}') to follow progress.\nUse cme_export_cancel(job_id='{job_id}') to cancel it.",
+    )]
+
+
+async def _tool_export_cancel(args: dict) -> list[TextContent]:
+    job_id = args["job_id"]
+    job = _jobs.get(job_id)
+    if not job:
+        return [TextContent(type="text", text=f"Unknown job_id: {job_id}")]
+
+    status = job.get("status")
+    if status in {"success", "failed", "error", "cancelled"}:
+        return [TextContent(type="text", text=f"Job {job_id} is already {status}.")]
+
+    proc = job.get("process")
+    if proc is not None and proc.returncode is None:
+        proc.terminate()
+
+    task = job.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+
+    job["status"] = "cancelling"
+    return [TextContent(
+        type="text",
+        text=(
+            f"Cancellation requested for job {job_id}. "
+            "Use cme_export_status(job_id=...) to confirm it reaches cancelled. "
+            "Files already written before cancellation are left in place."
+        ),
     )]
 
 
@@ -436,6 +628,8 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             lines.append(f"finished_at: {job['finished_at']}")
         if job.get("returncode") is not None:
             lines.append(f"returncode: {job['returncode']}")
+        if job.get("error"):
+            lines.append(f"error: {job['error']}")
         stdout = job.get("stdout", [])
         stderr = job.get("stderr", [])
         if stdout:
@@ -450,24 +644,58 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint — HTTP/SSE server
+# Entrypoint — Streamable HTTP server
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     _init_manifest_if_missing()
-    sse = SseServerTransport("/messages/")
+    streamable_http = StreamableHTTPSessionManager(
+        app=app,
+        event_store=None,
+        json_response=False,
+    )
 
-    async def handle_sse(request: Request) -> Response:
-        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-            await app.run(streams[0], streams[1], app.create_initialization_options())
-        return Response()
+    async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+
+        if path not in {"/mcp", "/mcp/"}:
+            response = PlainTextResponse("Not Found", status_code=404)
+            await response(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
+        if request.method == "GET" and _wants_html(request):
+            scheme = "https" if ssl_certfile else "http"
+            endpoint_url = f"{scheme}://{request.headers.get('host', f'{host}:{port}')}/mcp/"
+            response = HTMLResponse(
+                _render_landing_page(endpoint_url, scheme),
+                headers={"Cache-Control": "no-store"},
+            )
+            await response(scope, receive, send)
+            return
+
+        mcp_scope = dict(scope)
+        mcp_scope["path"] = "/"
+        mcp_scope["root_path"] = f"{scope.get('root_path', '').rstrip('/')}/mcp"
+        await streamable_http.handle_request(mcp_scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
+        async with streamable_http.run():
+            yield
 
     starlette_app = Starlette(
         routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
+            Mount("/", app=handle_mcp),
         ],
         middleware=[Middleware(_BearerAuthMiddleware)],
+        lifespan=lifespan,
+    )
+    starlette_app = CORSMiddleware(
+        starlette_app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE"],
+        expose_headers=["Mcp-Session-Id"],
     )
 
     host = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -489,7 +717,8 @@ def main() -> None:
     else:
         print(f"[cme-mcp] HTTP (pas de TLS)")
 
-    print(f"[cme-mcp] Écoute sur {'https' if ssl_certfile else 'http'}://{host}:{port}/sse")
+    scheme = "https" if ssl_certfile else "http"
+    print(f"[cme-mcp] Streamable HTTP sur {scheme}://{host}:{port}/mcp")
     uvicorn.run(starlette_app, **uvicorn_kwargs)
 
 

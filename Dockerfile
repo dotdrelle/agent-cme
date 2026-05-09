@@ -1,13 +1,14 @@
-FROM python:3.11-slim
+# python:3.13-slim si confluence-markdown-exporter n'a pas encore de wheel 3.14
+FROM python:3.14-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
     confluence-markdown-exporter \
-    mcp \
+    "mcp>=1.9.4" \
     starlette \
     uvicorn \
-    sse-starlette \
     pyyaml
 
 COPY cme_mcp_server.py sources-manifest.yaml .
