@@ -14,8 +14,12 @@ from pathlib import Path
 from typing import Any
 
 # Local venv support (dev mode without Docker)
-_CME_SITE = Path(__file__).parent / ".cme" / "lib" / "python3.11" / "site-packages"
-if _CME_SITE.exists():
+_CME_SITE = next(
+    (p for v in ("python3.14", "python3.13", "python3.12", "python3.11")
+     if (p := Path(__file__).parent / ".cme" / "lib" / v / "site-packages").exists()),
+    None,
+)
+if _CME_SITE:
     sys.path.insert(0, str(_CME_SITE))
 
 import yaml

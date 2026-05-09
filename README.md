@@ -209,7 +209,7 @@ MCP HTTP server dependencies in that venv:
 
 ```bash
 cd AgentCME
-python3.11 -m venv .cme
+python3 -m venv .cme
 .cme/bin/pip install --upgrade pip
 .cme/bin/pip install confluence-markdown-exporter "mcp>=1.9.4" starlette uvicorn pyyaml
 .cme/bin/python cme_mcp_server.py
