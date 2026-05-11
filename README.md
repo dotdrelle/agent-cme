@@ -39,6 +39,27 @@ for Streamable HTTP requests.
 Authentication is disabled by default. If you set `MCP_AUTH_TOKEN`, clients must
 send `Authorization: Bearer your_secret_token`.
 
+### CLI one-shot (profil `cli`)
+
+Pour configurer CME directement depuis la ligne de commande sans passer par un agent MCP :
+
+```bash
+# configure credentials interactively
+docker compose run --rm cme-cli configure
+
+# run an export manually
+docker compose run --rm cme-cli export
+```
+
+Le service `cme-cli` utilise le binaire `cme` de `confluence-markdown-exporter` et monte le même volume `./data` que `cme-mcp`. Les credentials écrits par `cme configure` sont immédiatement visibles par le serveur MCP.
+
+Depuis le compose racine du monorepo (`wikiLLM/`) :
+
+```bash
+docker compose run --rm cme-cli configure
+docker compose run --rm cme-cli export
+```
+
 ---
 
 ## First-run agent workflow

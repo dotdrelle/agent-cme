@@ -17,3 +17,17 @@ services:
       # Certificats HTTPS — décommenter si MCP_SSL_CERTFILE est renseigné
       #- ./certs:/certs:ro
     restart: unless-stopped
+
+  # CLI one-shot pour configurer CME directement (profil cli).
+  # Exemples :
+  #   docker compose run --rm cme-cli configure
+  #   docker compose run --rm cme-cli export
+  cme-cli:
+    build: .
+    profiles: [cli]
+    entrypoint: cme
+    environment:
+      - CME_CONFIG_PATH=/data/cme/app_data.json
+      - CME_EXPORT__OUTPUT_PATH=/data/exports
+    volumes:
+      - ./data:/data
