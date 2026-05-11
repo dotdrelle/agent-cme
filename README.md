@@ -10,7 +10,7 @@ MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm
 Orchestrating agent (Claude or other)
         │  MCP Streamable HTTP
         ▼
-  AgentCME MCP server  (port 8080)
+  AgentCME MCP server  (port 3000)
         │
         ├── /data/cme/app_data.json   ← CME credentials + connection settings (persistent)
         ├── /data/sources-manifest.yaml ← export sources managed by agent (persistent)
@@ -32,7 +32,7 @@ cd AgentCME
 docker compose up --build
 ```
 
-The MCP endpoint starts on `http://localhost:8080/mcp/`.
+The MCP endpoint starts on `http://localhost:3000/mcp/`.
 Opening that URL in a browser shows a status page. MCP clients use the same URL
 for Streamable HTTP requests.
 
@@ -158,13 +158,13 @@ docker compose up --build
 ### Claude Code
 
 ```bash
-claude mcp add --transport http cme http://localhost:8080/mcp/
+claude mcp add --transport http cme http://localhost:3000/mcp/
 ```
 
 If `MCP_AUTH_TOKEN` is set:
 
 ```bash
-claude mcp add --transport http cme http://localhost:8080/mcp/ \
+claude mcp add --transport http cme http://localhost:3000/mcp/ \
   --header "Authorization: Bearer your_secret_token"
 ```
 
@@ -177,7 +177,7 @@ Without token:
   "mcpServers": {
     "cme": {
       "type": "http",
-      "url": "http://localhost:8080/mcp/"
+      "url": "http://localhost:3000/mcp/"
     }
   }
 }
@@ -190,7 +190,7 @@ With token:
   "mcpServers": {
     "cme": {
       "type": "http",
-      "url": "http://localhost:8080/mcp/",
+      "url": "http://localhost:3000/mcp/",
       "headers": {
         "Authorization": "Bearer your_secret_token"
       }
@@ -205,7 +205,7 @@ Register AgentCME as an MCP server:
 
 ```
 Type: MCP (Streamable HTTP)
-URL:  http://localhost:8080/mcp/
+URL:  http://localhost:3000/mcp/
 Auth: None
 ```
 
@@ -213,7 +213,7 @@ If OpenWebUI itself runs in Docker, `localhost` means the OpenWebUI container,
 not your host. Use one of these instead:
 
 ```
-http://host.docker.internal:8080/mcp/
+http://host.docker.internal:3000/mcp/
 ```
 
 or, if OpenWebUI is on the same Compose network:
@@ -235,7 +235,8 @@ python3 -m venv .cme
 .cme/bin/pip install --upgrade pip
 .cme/bin/pip install confluence-markdown-exporter "mcp>=1.9.4" starlette uvicorn pyyaml
 .cme/bin/python cme_mcp_server.py
-# Starts on http://0.0.0.0:8080/mcp/
+# Starts on http://0.0.0.0:8080/mcp/ by default.
+# Use MCP_PORT=3000 .cme/bin/python cme_mcp_server.py if you want local dev on port 3000.
 # CME_DATA_DIR defaults to AgentCME/
 ```
 

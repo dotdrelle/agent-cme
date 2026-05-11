@@ -66,6 +66,8 @@ if not _MCP_TOKEN:
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        if request.method == "GET" and _wants_html(request):
+            return await call_next(request)
         if _MCP_TOKEN:
             auth = request.headers.get("authorization", "")
             if auth != f"Bearer {_MCP_TOKEN}":
@@ -94,7 +96,7 @@ def _wants_html(request: Request) -> bool:
 
 def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     auth_status = (
-        "Bearer token required"
+        "Bearer token enabled"
         if _MCP_TOKEN
         else "Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients."
     )
