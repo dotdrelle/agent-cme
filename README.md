@@ -72,7 +72,7 @@ Depuis le compose manager (`llm-wiki-manager/`) :
 
 ```bash
 cd ../llm-wiki-manager
-docker compose run --rm cme-cli configure
+docker compose run --rm cme-cli config
 docker compose run --rm cme-cli export
 ```
 
