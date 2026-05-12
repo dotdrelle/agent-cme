@@ -1,8 +1,10 @@
-# AgentCME — Agentic Confluence Markdown Exporter
+# agent-cme — Agentic Confluence Markdown Exporter
 
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
+
+`agent-cme` is the exporter only. It writes Markdown exports under `data/exports/`; importing those exports into one or more `llm-wiki` workspaces is handled by `llm-wiki-manager`.
 
 ## Architecture
 
@@ -10,7 +12,7 @@ MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm
 Orchestrating agent (Claude or other)
         │  MCP Streamable HTTP
         ▼
-  AgentCME MCP server  (port 3000)
+  agent-cme MCP server  (port 3000)
         │
         ├── /data/cme/app_data.json   ← CME credentials + connection settings (persistent)
         ├── /data/sources-manifest.yaml ← export sources managed by agent (persistent)
@@ -18,7 +20,7 @@ Orchestrating agent (Claude or other)
 ```
 
 All runtime state lives in `./data/` on the host, mounted as a Docker volume.
-No export source is versioned in Git. On first startup, AgentCME creates an empty
+No export source is versioned in Git. On first startup, agent-cme creates an empty
 runtime manifest at `./data/sources-manifest.yaml` if it does not already exist.
 MCP edits are persisted there and are not overwritten on later restarts.
 
@@ -26,8 +28,10 @@ MCP edits are persisted there and are not overwritten on later restarts.
 
 ## Quick start
 
+### Standalone
+
 ```bash
-cd AgentCME
+cd agent-cme
 
 docker compose up --build
 ```
@@ -38,6 +42,17 @@ for Streamable HTTP requests.
 
 Authentication is disabled by default. If you set `MCP_AUTH_TOKEN`, clients must
 send `Authorization: Bearer your_secret_token`.
+
+### From `llm-wiki-manager`
+
+When this repository is used alongside `llm-wiki-manager`, start the shared MCP server from the manager directory:
+
+```bash
+cd ../llm-wiki-manager
+./wiki-workspace cme up
+```
+
+The manager compose mounts `../agent-cme/data` into the container, so credentials, export source manifests, and exported Markdown remain in this repository.
 
 ### CLI one-shot (profil `cli`)
 
@@ -53,9 +68,10 @@ docker compose run --rm cme-cli export
 
 Le service `cme-cli` utilise le binaire `cme` de `confluence-markdown-exporter` et monte le même volume `./data` que `cme-mcp`. Les credentials écrits par `cme configure` sont immédiatement visibles par le serveur MCP.
 
-Depuis le compose racine du monorepo (`wikiLLM/`) :
+Depuis le compose manager (`llm-wiki-manager/`) :
 
 ```bash
+cd ../llm-wiki-manager
 docker compose run --rm cme-cli configure
 docker compose run --rm cme-cli export
 ```
@@ -83,27 +99,27 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 
 ## Tools reference
 
-| Tool | Description |
-|------|-------------|
-| `cme_status` | Check if CME is configured. Always call this first. |
-| `cme_setup` | One-time initialization: credentials + connection settings. |
-| `cme_sources_list` | List all configured export sources. |
-| `cme_source_add` | Add or update an export source (space or page). |
-| `cme_source_remove` | Remove an export source by name. |
-| `cme_export_run` | Start an async export. Returns a `job_id`. |
+| Tool                | Description                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `cme_status`        | Check if CME is configured. Always call this first.                                      |
+| `cme_setup`         | One-time initialization: credentials + connection settings.                              |
+| `cme_sources_list`  | List all configured export sources.                                                      |
+| `cme_source_add`    | Add or update an export source (space or page).                                          |
+| `cme_source_remove` | Remove an export source by name.                                                         |
+| `cme_export_run`    | Start an async export. Returns a `job_id`.                                               |
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
-| `cme_export_status` | Check job progress, or show last-export summary. |
+| `cme_export_status` | Check job progress, or show last-export summary.                                         |
 
 ### `cme_setup`
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `base_url` | string | yes | Confluence base URL, e.g. `http://confluence.example.com` |
-| `username` | string | no | Username or email |
-| `pat` | string | no | Personal Access Token (self-hosted) |
-| `api_token` | string | no | API token (Atlassian Cloud) |
-| `verify_ssl` | boolean | no | Verify SSL certificates (default: `true`) |
-| `use_v2_api` | boolean | no | Use REST API v2 — Data Center 8+ or Cloud (default: `false`) |
+| Parameter    | Type    | Required | Description                                                    |
+| ------------ | ------- | -------- | -------------------------------------------------------------- |
+| `base_url`   | string  | yes      | Confluence base URL, e.g. `http://confluence.example.com`      |
+| `username`   | string  | no       | Username or email                                              |
+| `pat`        | string  | no       | Personal Access Token (self-hosted)                            |
+| `api_token`  | string  | no       | API token (Atlassian Cloud)                                    |
+| `verify_ssl` | boolean | no       | Verify SSL certificates (default: `true`)                      |
+| `use_v2_api` | boolean | no       | Use REST API v2 — Data Center 8+ or Cloud (default: `false`)   |
 
 Provide either `pat` for self-hosted Confluence, or `username` + `api_token`
 for Atlassian Cloud. `base_url` alone stores connection settings but does not
@@ -111,14 +127,14 @@ make `cme_status` return `configured`.
 
 ### `cme_source_add`
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | string | yes | Short identifier, e.g. `juno` |
-| `type` | string | no | `space` (default) or `page` |
-| `base_url` | string | if `type=space` | Confluence base URL |
-| `space` | string | if `type=space` | Space key, e.g. `JDLCDPPO` |
-| `url` | string | if `type=page` | Full Confluence page URL |
-| `description` | string | no | Human description |
+| Parameter     | Type   | Required          | Description                    |
+| ------------- | ------ | ----------------- | ------------------------------ |
+| `name`        | string | yes               | Short identifier               |
+| `type`        | string | no                | `space` (default) or `page`    |
+| `base_url`    | string | if `type=space`   | Confluence base URL            |
+| `space`       | string | if `type=space`   | Confluence space key           |
+| `url`         | string | if `type=page`    | Full Confluence page URL       |
+| `description` | string | no                | Human description              |
 
 ---
 
@@ -128,7 +144,7 @@ To enable TLS, uncomment the SSL lines in `docker-compose.yml` and provide certi
 
 ```bash
 mkdir certs
-# Place server.crt and server.key in AgentCME/certs/
+# Place server.crt and server.key in agent-cme/certs/
 ```
 
 ```yaml
@@ -151,7 +167,7 @@ The server refuses to start if only one of the two SSL variables is set, or if a
 With Docker Compose:
 
 ```bash
-cd AgentCME
+cd agent-cme
 docker compose up --build
 ```
 
@@ -201,7 +217,7 @@ With token:
 
 ### OpenWebUI
 
-Register AgentCME as an MCP server:
+Register agent-cme as an MCP server:
 
 ```
 Type: MCP (Streamable HTTP)
@@ -230,17 +246,18 @@ The server auto-detects the local CME venv at `.cme/`. Install both CME and the
 MCP HTTP server dependencies in that venv:
 
 ```bash
-cd AgentCME
+cd agent-cme
 python3 -m venv .cme
 .cme/bin/pip install --upgrade pip
 .cme/bin/pip install confluence-markdown-exporter "mcp>=1.9.4" starlette uvicorn pyyaml
 .cme/bin/python cme_mcp_server.py
 # Starts on http://0.0.0.0:8080/mcp/ by default.
 # Use MCP_PORT=3000 .cme/bin/python cme_mcp_server.py if you want local dev on port 3000.
-# CME_DATA_DIR defaults to AgentCME/
+# CME_DATA_DIR defaults to agent-cme/
 ```
 
 CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not set:
+
 - macOS: `~/Library/Application Support/confluence-markdown-exporter/app_data.json`
 - Linux: `~/.config/confluence-markdown-exporter/app_data.json`
 
@@ -249,7 +266,7 @@ CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not se
 ## Data directory layout
 
 ```
-AgentCME/data/               ← mounted at /data in the container
+agent-cme/data/               ← mounted at /data in the container
 ├── cme/
 │   └── app_data.json        ← CME credentials + settings (written by cme_setup)
 ├── sources-manifest.yaml    ← runtime export sources (created empty, then managed by agent)
@@ -259,9 +276,22 @@ AgentCME/data/               ← mounted at /data in the container
 
 `data/` is gitignored — it contains credentials and generated content.
 
+## Relationship With llm-wiki
+
+Use `agent-cme` to create exports from Confluence. Use `llm-wiki-manager` to copy selected export directories into a target `llm-wiki` workspace and run:
+
+```bash
+./wiki-workspace wiki <workspace> doctor
+./wiki-workspace wiki <workspace> ingest
+./wiki-workspace wiki <workspace> build
+./wiki-workspace wiki <workspace> export
+```
+
+Do not point `agent-cme` directly at arbitrary workspace `raw/untracked` folders. Keeping export and ingest responsibilities separate avoids cross-workspace data leaks.
+
 ---
 
 ## License
 
-AgentCME is licensed under the same license as `llm-wiki`:
+agent-cme is licensed under the same license as `llm-wiki`:
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).

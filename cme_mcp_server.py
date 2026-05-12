@@ -101,13 +101,13 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         else "Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients."
     )
     tool_names = [
-        ("cme_status", "Check AgentCME runtime configuration and readiness."),
-        ("cme_setup", "Store AgentCME Confluence credentials and connection settings."),
-        ("cme_sources_list", "List AgentCME configured Confluence export sources."),
+        ("cme_status", "Check agent-cme runtime configuration and readiness."),
+        ("cme_setup", "Store agent-cme Confluence credentials and connection settings."),
+        ("cme_sources_list", "List agent-cme configured Confluence export sources."),
         ("cme_source_add", "Add or update a Confluence export source."),
         ("cme_source_remove", "Remove an export source by name."),
         ("cme_export_run", "Start an asynchronous markdown export."),
-        ("cme_export_cancel", "Cancel a running AgentCME export job."),
+        ("cme_export_cancel", "Cancel a running agent-cme export job."),
         ("cme_export_status", "Check export progress or last-export summary."),
     ]
     tools = "\n".join(
@@ -120,7 +120,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AgentCME MCP connector</title>
+  <title>agent-cme MCP connector</title>
   <style>
     :root {{ color-scheme: light dark; --bg: #f8fafc; --panel: #ffffff; --text: #111827; --muted: #64748b; --line: #d8dee8; --accent: #2563eb; --code: #eef2ff; }}
     @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0f172a; --panel: #111827; --text: #f8fafc; --muted: #94a3b8; --line: #253044; --accent: #60a5fa; --code: #1e293b; }} }}
@@ -147,7 +147,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <body>
   <main>
     <div class="eyebrow">MCP Streamable HTTP</div>
-    <h1>AgentCME MCP connector</h1>
+    <h1>agent-cme MCP connector</h1>
     <p class="lead">This endpoint is intended for MCP clients such as Claude and OpenWebUI. Browsers can view this status page; MCP clients should send Streamable HTTP requests to the same URL.</p>
     <section class="panel">
       <dl>
@@ -232,9 +232,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_status",
             description=(
-                "Check AgentCME runtime configuration and readiness. "
-                "Use this for questions about the AgentCME agent/server config, Confluence credentials, SSL/API mode, or last export state. "
-                "Do not use wiki tools for live AgentCME configuration. "
+                "Check agent-cme runtime configuration and readiness. "
+                "Use this for questions about the agent-cme agent/server config, Confluence credentials, SSL/API mode, or last export state. "
+                "Do not use wiki tools for live agent-cme configuration. "
                 "Call this first — returns 'configured' or 'not_configured'. "
                 "If not_configured, call cme_setup before doing anything else."
             ),
@@ -243,8 +243,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_setup",
             description=(
-                "One-time AgentCME initialization: stores Confluence credentials and connection settings persistently. "
-                "Use this only to configure the live AgentCME Confluence exporter, not to edit llm-wiki markdown pages. "
+                "One-time agent-cme initialization: stores Confluence credentials and connection settings persistently. "
+                "Use this only to configure the live agent-cme Confluence exporter, not to edit llm-wiki markdown pages. "
                 "After setup the server is autonomous — no reconfiguration needed on restart. "
                 "Provide pat (self-hosted PAT) or username+api_token (Atlassian Cloud)."
             ),
@@ -264,8 +264,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_sources_list",
             description=(
-                "List AgentCME configured Confluence export sources from the live manifest. "
-                "Use this for questions about which Confluence spaces/pages the AgentCME agent exports. "
+                "List agent-cme configured Confluence export sources from the live manifest. "
+                "Use this for questions about which Confluence spaces/pages the agent-cme agent exports. "
                 "Do not use llm-wiki source listing tools for this runtime manifest."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
@@ -273,8 +273,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_source_add",
             description=(
-                "Add or update an AgentCME Confluence export source in the live manifest. "
-                "Use this to configure what AgentCME exports, not to ingest or edit llm-wiki content. "
+                "Add or update an agent-cme Confluence export source in the live manifest. "
+                "Use this to configure what agent-cme exports, not to ingest or edit llm-wiki content. "
                 "For type=space: provide base_url + space key. "
                 "For type=page: provide url (full Confluence page URL)."
             ),
@@ -294,8 +294,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_source_remove",
             description=(
-                "Remove an AgentCME Confluence export source from the live manifest by name. "
-                "Use this for AgentCME export configuration only."
+                "Remove an agent-cme Confluence export source from the live manifest by name. "
+                "Use this for agent-cme export configuration only."
             ),
             inputSchema={
                 "type": "object",
@@ -308,8 +308,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_export_run",
             description=(
-                "Start an asynchronous AgentCME Confluence-to-Markdown export for one or all configured sources. "
-                "Use this when the user asks AgentCME to run or refresh an export. "
+                "Start an asynchronous agent-cme Confluence-to-Markdown export for one or all configured sources. "
+                "Use this when the user asks agent-cme to run or refresh an export. "
                 "Use cme_export_cancel(job_id=...) to request cancellation of a running export; files already written before cancellation are left in place. "
                 "If the export fails during the initial Confluence preflight request, such as /rest/api/space?limit=1, no markdown export files have been written yet. "
                 "Returns a job_id immediately. Use cme_export_status(job_id=...) to follow progress."
@@ -325,7 +325,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_export_cancel",
             description=(
-                "Cancel a running AgentCME export job by job_id. "
+                "Cancel a running agent-cme export job by job_id. "
                 "This terminates the active cme subprocess when possible and marks the job cancelled. "
                 "It does not delete files already written before cancellation."
             ),
@@ -340,8 +340,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_export_status",
             description=(
-                "Check AgentCME export job status, or return export lock/state summary if no job_id is given. "
-                "Use this for live export progress and recent AgentCME export state."
+                "Check agent-cme export job status, or return export lock/state summary if no job_id is given. "
+                "Use this for live export progress and recent agent-cme export state."
             ),
             inputSchema={
                 "type": "object",
