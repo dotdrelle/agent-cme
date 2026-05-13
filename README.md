@@ -6,6 +6,16 @@ MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm
 
 `agent-cme` is the exporter only. It writes Markdown exports under `data/exports/`; importing those exports into one or more `llm-wiki` workspaces is handled by `llm-wiki-manager`.
 
+It belongs to a three-repository toolchain:
+
+| Repository | Role |
+| ---------- | ---- |
+| [`AgentCME`](https://github.com/dotdrelle/AgentCME) | Confluence Markdown exporter and MCP server |
+| [`llm-wiki`](https://github.com/dotdrelle/llm-wiki) | Local wiki workspace engine that ingests Markdown and builds deliverables |
+| [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces and copies selected exports |
+
+Do not configure `agent-cme` with a wiki workspace path. Keep exports in `agent-cme/data/exports/`, then let the manager copy selected Markdown into the target workspace.
+
 ## Architecture
 
 ```
@@ -54,21 +64,21 @@ cd ../llm-wiki-manager
 
 The manager compose mounts `../agent-cme/data` into the container, so credentials, export source manifests, and exported Markdown remain in this repository.
 
-### CLI one-shot (profil `cli`)
+### CLI one-shot (`cli` profile)
 
-Pour configurer CME directement depuis la ligne de commande sans passer par un agent MCP :
+Configure CME directly from the command line without going through an MCP agent:
 
 ```bash
 # configure credentials interactively
-docker compose run --rm cme-cli configure
+docker compose run --rm cme-cli config
 
 # run an export manually
 docker compose run --rm cme-cli export
 ```
 
-Le service `cme-cli` utilise le binaire `cme` de `confluence-markdown-exporter` et monte le même volume `./data` que `cme-mcp`. Les credentials écrits par `cme configure` sont immédiatement visibles par le serveur MCP.
+The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Credentials written by `cme config` are immediately visible to the MCP server.
 
-Depuis le compose manager (`llm-wiki-manager/`) :
+From the manager compose file (`llm-wiki-manager/`):
 
 ```bash
 cd ../llm-wiki-manager
@@ -283,6 +293,7 @@ Use `agent-cme` to create exports from Confluence. Use `llm-wiki-manager` to cop
 ```bash
 ./wiki-workspace wiki <workspace> doctor
 ./wiki-workspace wiki <workspace> ingest
+./wiki-workspace wiki <workspace> build --plan
 ./wiki-workspace wiki <workspace> build
 ./wiki-workspace wiki <workspace> export
 ```
