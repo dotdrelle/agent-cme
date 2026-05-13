@@ -512,7 +512,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text="Error: no sources defined. Use cme_source_add first.")]
 
     space_urls = [_source_url(s) for s in sources if s.get("type", "space") == "space"]
-    page_urls = [_source_url(s) for s in sources if s.get("type", "page") == "page"]
+    page_urls = [_source_url(s) for s in sources if s.get("type", "space") == "page"]
 
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
@@ -699,6 +699,7 @@ def main() -> None:
         starlette_app,
         allow_origins=["*"],
         allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["*"],
         expose_headers=["Mcp-Session-Id"],
     )
 
