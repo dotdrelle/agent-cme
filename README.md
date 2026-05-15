@@ -10,7 +10,7 @@ It belongs to a three-repository toolchain:
 
 | Repository | Role |
 | ---------- | ---- |
-| [`AgentCME`](https://github.com/dotdrelle/AgentCME) | Confluence Markdown exporter and MCP server |
+| [`agent-cme`](https://github.com/dotdrelle/agent-cme) | Confluence Markdown exporter and MCP server |
 | [`llm-wiki`](https://github.com/dotdrelle/llm-wiki) | Local wiki workspace engine that ingests Markdown and builds deliverables |
 | [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces and copies selected exports |
 
