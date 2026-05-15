@@ -50,8 +50,9 @@ The MCP endpoint starts on `http://localhost:3000/mcp/`.
 Opening that URL in a browser shows a status page. MCP clients use the same URL
 for Streamable HTTP requests.
 
-Authentication is disabled by default. If you set `MCP_AUTH_TOKEN`, clients must
-send `Authorization: Bearer your_secret_token`.
+Authentication is disabled by default. With Docker Compose, set
+`CME_MCP_AUTH_TOKEN`; it is mapped to the internal `MCP_AUTH_TOKEN` used by the
+server. Clients must then send `Authorization: Bearer your_secret_token`.
 
 ### From `llm-wiki-manager`
 
@@ -187,7 +188,8 @@ docker compose up --build
 claude mcp add --transport http cme http://localhost:3000/mcp/
 ```
 
-If `MCP_AUTH_TOKEN` is set:
+If `CME_MCP_AUTH_TOKEN` is set in Docker Compose, or `MCP_AUTH_TOKEN` is set for
+direct local development:
 
 ```bash
 claude mcp add --transport http cme http://localhost:3000/mcp/ \
