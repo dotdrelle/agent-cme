@@ -246,19 +246,20 @@ async def list_tools() -> list[Tool]:
                 "One-time agent-cme initialization: stores Confluence credentials and connection settings persistently. "
                 "Use this only to configure the live agent-cme Confluence exporter, not to edit llm-wiki markdown pages. "
                 "After setup the server is autonomous — no reconfiguration needed on restart. "
-                "Provide pat (self-hosted PAT) or username+api_token (Atlassian Cloud)."
+                "Always provide username as the Confluence email/login. "
+                "Provide pat (self-hosted PAT) or api_token (Atlassian Cloud)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.meteo.fr"},
-                    "username": {"type": "string", "description": "Username or email"},
+                    "username": {"type": "string", "description": "Confluence email address or login"},
                     "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
                     "api_token": {"type": "string", "description": "API token (Atlassian Cloud)"},
                     "verify_ssl": {"type": "boolean", "description": "Verify SSL certificates (default: true)"},
                     "use_v2_api": {"type": "boolean", "description": "Use Confluence REST API v2 — for Data Center 8+ or Cloud (default: false)"},
                 },
-                "required": ["base_url"],
+                "required": ["base_url", "username"],
             },
         ),
         Tool(
@@ -421,16 +422,17 @@ async def _tool_status() -> list[TextContent]:
 
 async def _tool_setup(args: dict) -> list[TextContent]:
     base_url: str = args["base_url"].rstrip("/")
-    username: str = args.get("username", "")
+    username: str = str(args.get("username", "")).strip()
     pat: str = args.get("pat", "")
     api_token: str = args.get("api_token", "")
     verify_ssl: bool = args.get("verify_ssl", True)
     use_v2_api: bool = args.get("use_v2_api", False)
     try:
+        if not username:
+            return [TextContent(type="text", text="Error: username is required. Provide the Confluence email address or login.")]
         if os.environ.get("CME_CONFIG_PATH"):
             Path(os.environ["CME_CONFIG_PATH"]).parent.mkdir(parents=True, exist_ok=True)
-        if username:
-            set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
+        set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
         if pat:
             set_setting_with_keys(["auth", "confluence", base_url, "pat"], pat)
         if api_token:

@@ -4,7 +4,10 @@
 
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
-`agent-cme` is the exporter only. It writes Markdown exports under `data/exports/`; importing those exports into one or more `llm-wiki` workspaces is handled by `llm-wiki-manager`.
+`agent-cme` is the exporter only. By default, standalone runs write Markdown
+exports under `data/exports/`. When launched by `llm-wiki-manager`, the manager
+mounts a specific workspace so exports land directly in that workspace's
+`raw/untracked/` directory.
 
 It belongs to a three-repository toolchain:
 
@@ -12,9 +15,11 @@ It belongs to a three-repository toolchain:
 | ---------- | ---- |
 | [`agent-cme`](https://github.com/dotdrelle/agent-cme) | Confluence Markdown exporter and MCP server |
 | [`llm-wiki`](https://github.com/dotdrelle/llm-wiki) | Local wiki workspace engine that ingests Markdown and builds deliverables |
-| [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces and copies selected exports |
+| [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces and workspace-scoped CME agents |
 
-Do not configure `agent-cme` with a wiki workspace path. Keep exports in `agent-cme/data/exports/`, then let the manager copy selected Markdown into the target workspace.
+Do not hard-code workspace paths inside `agent-cme`. The agent always works with
+its container paths (`/data` and `/data/exports`); the manager decides which
+workspace those paths map to.
 
 ## Architecture
 
@@ -56,14 +61,23 @@ server. Clients must then send `Authorization: Bearer your_secret_token`.
 
 ### From `llm-wiki-manager`
 
-When this repository is used alongside `llm-wiki-manager`, start the shared MCP server from the manager directory:
+When this repository is used alongside `llm-wiki-manager`, start a
+workspace-scoped CME MCP server from the manager directory:
 
 ```bash
 cd ../llm-wiki-manager
-./wiki-workspace cme up
+./wiki-workspace cme <workspace> up
 ```
 
-The manager compose mounts `../agent-cme/data` into the container, so credentials, export source manifests, and exported Markdown remain in this repository.
+The manager compose mounts:
+
+```text
+<workspace>/.cme          -> /data
+<workspace>/raw/untracked -> /data/exports
+```
+
+So credentials and source manifests are stored under `<workspace>/.cme/`, while
+exported Markdown is written directly to `<workspace>/raw/untracked/`.
 
 ### CLI one-shot (`cli` profile)
 
@@ -79,13 +93,17 @@ docker compose run --rm cme-cli export
 
 The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Credentials written by `cme config` are immediately visible to the MCP server.
 
-From the manager compose file (`llm-wiki-manager/`):
+From the manager compose file (`llm-wiki-manager/`), prefer the workspace-scoped
+MCP service:
 
 ```bash
 cd ../llm-wiki-manager
-docker compose run --rm cme-cli config
-docker compose run --rm cme-cli export
+./wiki-workspace cme <workspace> up
 ```
+
+The manager's `cme-cli` profile is still available for debugging, but it must be
+run with a workspace `.env` so `WIKI_WORKSPACE_PATH` points at the intended
+workspace.
 
 ---
 
@@ -126,15 +144,16 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | Parameter    | Type    | Required | Description                                                    |
 | ------------ | ------- | -------- | -------------------------------------------------------------- |
 | `base_url`   | string  | yes      | Confluence base URL, e.g. `http://confluence.example.com`      |
-| `username`   | string  | no       | Username or email                                              |
+| `username`   | string  | yes      | Confluence email address or login                              |
 | `pat`        | string  | no       | Personal Access Token (self-hosted)                            |
 | `api_token`  | string  | no       | API token (Atlassian Cloud)                                    |
 | `verify_ssl` | boolean | no       | Verify SSL certificates (default: `true`)                      |
 | `use_v2_api` | boolean | no       | Use REST API v2 — Data Center 8+ or Cloud (default: `false`)   |
 
-Provide either `pat` for self-hosted Confluence, or `username` + `api_token`
-for Atlassian Cloud. `base_url` alone stores connection settings but does not
-make `cme_status` return `configured`.
+Always provide `username` as the Confluence email/login. Provide either `pat`
+for self-hosted Confluence, or `api_token` for Atlassian Cloud. `base_url` and
+`username` alone store connection settings but do not make `cme_status` return
+`configured`.
 
 ### `cme_source_add`
 
@@ -290,7 +309,8 @@ agent-cme/data/               ← mounted at /data in the container
 
 ## Relationship With llm-wiki
 
-Use `agent-cme` to create exports from Confluence. Use `llm-wiki-manager` to copy selected export directories into a target `llm-wiki` workspace and run:
+Use `agent-cme` to create exports from Confluence. In manager mode, exports land
+directly in the target workspace, then run:
 
 ```bash
 ./wiki-workspace wiki <workspace> doctor
@@ -300,7 +320,8 @@ Use `agent-cme` to create exports from Confluence. Use `llm-wiki-manager` to cop
 ./wiki-workspace wiki <workspace> export
 ```
 
-Do not point `agent-cme` directly at arbitrary workspace `raw/untracked` folders. Keeping export and ingest responsibilities separate avoids cross-workspace data leaks.
+The workspace binding is provided by Docker mounts from `llm-wiki-manager`; keep
+`agent-cme` itself workspace-agnostic.
 
 ---
 
