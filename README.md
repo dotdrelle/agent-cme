@@ -133,7 +133,7 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | `cme_status`        | Check if CME is configured. Always call this first.                                      |
 | `cme_setup`         | One-time initialization: credentials + connection settings.                              |
 | `cme_sources_list`  | List all configured export sources.                                                      |
-| `cme_source_add`    | Add or update an export source (space or page).                                          |
+| `cme_source_add`    | Add or update an export source (space, page, or page-with-descendants).                  |
 | `cme_source_remove` | Remove an export source by name.                                                         |
 | `cme_export_run`    | Start an async export. Returns a `job_id`.                                               |
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
@@ -160,10 +160,10 @@ for self-hosted Confluence, or `api_token` for Atlassian Cloud. `base_url` and
 | Parameter     | Type   | Required          | Description                    |
 | ------------- | ------ | ----------------- | ------------------------------ |
 | `name`        | string | yes               | Short identifier               |
-| `type`        | string | no                | `space` (default) or `page`    |
+| `type`        | string | no                | `space` (default), `page`, or `page-with-descendants` |
 | `base_url`    | string | if `type=space`   | Confluence base URL            |
 | `space`       | string | if `type=space`   | Confluence space key           |
-| `url`         | string | if `type=page`    | Full Confluence page URL       |
+| `url`         | string | if `type=page*`   | Full Confluence page URL       |
 | `description` | string | no                | Human description              |
 
 ---

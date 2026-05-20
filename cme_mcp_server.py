@@ -201,7 +201,7 @@ def _init_manifest_if_missing() -> None:
 
 
 def _source_url(source: dict) -> str:
-    if source.get("type", "space") == "page":
+    if source.get("type", "space") in {"page", "page-with-descendants"}:
         return source["url"]
     return f"{source['base_url'].rstrip('/')}/display/{source['space']}"
 
@@ -277,16 +277,17 @@ async def list_tools() -> list[Tool]:
                 "Add or update an agent-cme Confluence export source in the live manifest. "
                 "Use this to configure what agent-cme exports, not to ingest or edit llm-wiki content. "
                 "For type=space: provide base_url + space key. "
-                "For type=page: provide url (full Confluence page URL)."
+                "For type=page: provide url (full Confluence page URL). "
+                "For type=page-with-descendants: provide url to export that page and all pages below it."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Short identifier, e.g. 'juno'"},
-                    "type": {"type": "string", "enum": ["space", "page"], "description": "Export type (default: space)"},
+                    "type": {"type": "string", "enum": ["space", "page", "page-with-descendants"], "description": "Export type (default: space)"},
                     "base_url": {"type": "string", "description": "Confluence base URL (required for type=space)"},
                     "space": {"type": "string", "description": "Space key, e.g. 'JDLCDPPO' (required for type=space)"},
-                    "url": {"type": "string", "description": "Full page URL (required for type=page)"},
+                    "url": {"type": "string", "description": "Full page URL (required for type=page or type=page-with-descendants)"},
                     "description": {"type": "string", "description": "Human description of this source"},
                 },
                 "required": ["name"],
@@ -468,15 +469,17 @@ async def _tool_source_add(args: dict) -> list[TextContent]:
     entry: dict = existing or {}
     entry["name"] = name
     entry["type"] = source_type
-    if source_type == "page":
+    if source_type in {"page", "page-with-descendants"}:
         if not args.get("url"):
-            return [TextContent(type="text", text="Error: 'url' is required for type=page")]
+            return [TextContent(type="text", text=f"Error: 'url' is required for type={source_type}")]
         entry["url"] = args["url"]
-    else:
+    elif source_type == "space":
         if not args.get("base_url") or not args.get("space"):
             return [TextContent(type="text", text="Error: 'base_url' and 'space' are required for type=space")]
         entry["base_url"] = args["base_url"]
         entry["space"] = args["space"]
+    else:
+        return [TextContent(type="text", text=f"Error: unsupported source type '{source_type}'")]
     if args.get("description"):
         entry["description"] = args["description"]
     if existing is None:
@@ -515,6 +518,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
 
     space_urls = [_source_url(s) for s in sources if s.get("type", "space") == "space"]
     page_urls = [_source_url(s) for s in sources if s.get("type", "space") == "page"]
+    page_descendant_urls = [_source_url(s) for s in sources if s.get("type", "space") == "page-with-descendants"]
 
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
@@ -570,6 +574,8 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 rc = await _run_cmd([_CME_BIN, "spaces", *space_urls])
             if page_urls and rc == 0:
                 rc = await _run_cmd([_CME_BIN, "pages", *page_urls])
+            if page_descendant_urls and rc == 0:
+                rc = await _run_cmd([_CME_BIN, "pages-with-descendants", *page_descendant_urls])
             _jobs[job_id]["returncode"] = rc
             _jobs[job_id]["status"] = "success" if rc == 0 else "failed"
             _jobs[job_id]["finished_at"] = datetime.now().isoformat()
