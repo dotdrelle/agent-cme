@@ -312,6 +312,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Start an asynchronous agent-cme Confluence-to-Markdown export for one or all configured sources. "
                 "Use this when the user asks agent-cme to run or refresh an export. "
+                "This only exports Confluence content to Markdown files on disk; it does not ingest content into llm-wiki. "
+                "To ingest exported files into the wiki, run production_start_job(type=\"ingest\") separately. "
                 "Use cme_export_cancel(job_id=...) to request cancellation of a running export; files already written before cancellation are left in place. "
                 "If the export fails during the initial Confluence preflight request, such as /rest/api/space?limit=1, no markdown export files have been written yet. "
                 "Returns a job_id immediately. Use cme_export_status(job_id=...) to follow progress."
