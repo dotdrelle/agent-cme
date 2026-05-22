@@ -1,6 +1,6 @@
 # agent-cme — Agentic Confluence Markdown Exporter
 
-[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
 
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
@@ -57,7 +57,7 @@ for Streamable HTTP requests.
 
 Authentication is disabled by default. With Docker Compose, set
 `CME_MCP_AUTH_TOKEN`; it is mapped to the internal `MCP_AUTH_TOKEN` used by the
-server. Clients must then send `Authorization: Bearer your_secret_token`.
+server. Clients must then send `Authorization: Bearer <generated-local-token>`.
 
 ### From `llm-wiki-manager`
 
@@ -212,7 +212,7 @@ direct local development:
 
 ```bash
 claude mcp add --transport http cme http://localhost:3000/mcp/ \
-  --header "Authorization: Bearer your_secret_token"
+  --header "Authorization: Bearer <generated-local-token>"
 ```
 
 ### Claude Code (`.mcp.json`)
@@ -239,7 +239,7 @@ With token:
       "type": "http",
       "url": "http://localhost:3000/mcp/",
       "headers": {
-        "Authorization": "Bearer your_secret_token"
+        "Authorization": "Bearer <generated-local-token>"
       }
     }
   }
@@ -327,5 +327,4 @@ The workspace binding is provided by Docker mounts from `llm-wiki-manager`; keep
 
 ## License
 
-agent-cme is licensed under the same license as `llm-wiki`:
-[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
+Released under the **PolyForm Noncommercial License 1.0.0**. See [LICENSE](LICENSE).
