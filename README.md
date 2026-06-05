@@ -112,13 +112,19 @@ workspace.
 On first start, CME has no credentials. The agent must call `cme_setup` once.
 After that, the server is fully autonomous across restarts.
 
+`cme_setup` is synchronous: it writes configuration and returns immediately. It
+does not create `_activity` metadata and will not appear in an Activity panel.
+An orchestrator should either call it in the same turn, ask for missing required
+credentials, or report that the CME tool/server is unavailable. It should not
+answer with a plain-text promise to call `cme_setup` later.
+
 ```
 1. cme_status          → "not_configured — call cme_setup"
 2. cme_setup(...)      → credentials + connection settings written to /data/cme/app_data.json
 3. cme_sources_list()  → inspect runtime sources from /data/sources-manifest.yaml
 4. cme_source_add(...) → add/update sources if needed
-5. cme_export_run(...) → async export started, returns job_id
-6. cme_export_status(job_id=...) → monitor progress
+5. cme_export_run(...) → async export started, returns JSON with `job_id` and `_activity`
+6. cme_export_status(job_id=...) → monitor progress, returns JSON with `_activity`
 7. cme_export_cancel(job_id=...) → cancel a running export when needed
 ```
 
@@ -135,9 +141,34 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | `cme_sources_list`  | List all configured export sources.                                                      |
 | `cme_source_add`    | Add or update an export source (space, page, or page-with-descendants).                  |
 | `cme_source_remove` | Remove an export source by name.                                                         |
-| `cme_export_run`    | Start an async export. Returns a `job_id`.                                               |
+| `cme_export_run`    | Start an async export. Returns JSON with `job_id`, status, sources, and `_activity`.      |
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
-| `cme_export_status` | Check job progress, or show last-export summary.                                         |
+| `cme_export_status` | Check job progress, or show last-export summary. With `job_id`, returns `_activity`.      |
+
+### Activity metadata
+
+`cme_export_run` and `cme_export_status(job_id=...)` include additive
+`_activity` metadata so shells/orchestrators can monitor jobs without knowing
+CME-specific response details:
+
+```json
+{
+  "job_id": "abc12345",
+  "status": "running",
+  "_activity": {
+    "id": "abc12345",
+    "source": "cme",
+    "kind": "export",
+    "status": "running",
+    "poll": {
+      "server": "cme",
+      "tool": "cme_export_status",
+      "args": { "job_id": "abc12345" },
+      "intervalMs": 2500
+    }
+  }
+}
+```
 
 ### `cme_setup`
 

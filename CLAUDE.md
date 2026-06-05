@@ -28,8 +28,15 @@ export directory.
   `api_token`, `pat`, and `password` must stay redacted in status responses.
 - Authentication is optional for local development, but any documented token
   examples must use placeholders such as `<generated-local-token>`.
+- `cme_setup` is synchronous configuration. Orchestrators should call it
+  directly when required credentials are available, ask for exact missing
+  values, or report unavailable CME tooling. Do not model setup as a background
+  activity.
 - Exports should be asynchronous and cancellable. Do not block the MCP request
   until a full Confluence export completes.
+- `cme_export_run` and `cme_export_status(job_id=...)` should return JSON with
+  additive `_activity` metadata so managers can poll progress through
+  `cme.cme_export_status` without parsing CME-specific text.
 - Keep `agent-cme` workspace-agnostic. It should not know about
   `llm-wiki-manager` workspace names beyond the mounts it receives.
 

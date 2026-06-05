@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -177,6 +177,50 @@ def _mask_secrets(data: Any) -> Any:
     if isinstance(data, list):
         return [_mask_secrets(i) for i in data]
     return data
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _terminal_status(status: Any) -> bool:
+    return str(status or "").lower() in {"success", "failed", "error", "cancelled", "canceled", "done", "completed"}
+
+
+def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "running")
+    sources = job.get("sources") or []
+    label = f"CME export · {status}"
+    if sources:
+        label = f"{label} · {', '.join(str(source) for source in sources[:3])}"
+        if len(sources) > 3:
+            label = f"{label} +{len(sources) - 3}"
+    return {
+        "id": job_id,
+        "source": "cme",
+        "kind": "export",
+        "label": label,
+        "status": status,
+        "progress": {
+            "step": "export",
+            "stdoutLines": len(job.get("stdout") or []),
+            "stderrLines": len(job.get("stderr") or []),
+        },
+        "poll": {
+            "server": "cme",
+            "tool": "cme_export_status",
+            "args": {"job_id": job_id},
+            "intervalMs": 2500,
+        } if not _terminal_status(status) else None,
+        "startedAt": job.get("started_at"),
+        "updatedAt": job.get("finished_at") or _now(),
+        "error": job.get("error"),
+        "terminal": _terminal_status(status),
+    }
+
+
+def _json_content(payload: dict[str, Any]) -> TextContent:
+    return TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _load_manifest() -> dict:
@@ -526,7 +570,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     _jobs[job_id] = {
         "status": "starting",
         "sources": [s["name"] for s in sources],
-        "started_at": datetime.now().isoformat(),
+        "started_at": _now(),
         "stdout": [],
         "stderr": [],
         "returncode": None,
@@ -580,21 +624,25 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 rc = await _run_cmd([_CME_BIN, "pages-with-descendants", *page_descendant_urls])
             _jobs[job_id]["returncode"] = rc
             _jobs[job_id]["status"] = "success" if rc == 0 else "failed"
-            _jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            _jobs[job_id]["finished_at"] = _now()
         except asyncio.CancelledError:
             _jobs[job_id]["status"] = "cancelled"
-            _jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            _jobs[job_id]["finished_at"] = _now()
             _jobs[job_id]["error"] = "Export cancelled by cme_export_cancel."
         except Exception as e:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = str(e)
-            _jobs[job_id]["finished_at"] = datetime.now().isoformat()
+            _jobs[job_id]["finished_at"] = _now()
 
     _jobs[job_id]["task"] = asyncio.create_task(_run())
-    return [TextContent(
-        type="text",
-        text=f"Export started — job_id: {job_id}\nSources: {', '.join(s['name'] for s in sources)}\nUse cme_export_status(job_id='{job_id}') to follow progress.\nUse cme_export_cancel(job_id='{job_id}') to cancel it.",
-    )]
+    return [_json_content({
+        "ok": True,
+        "job_id": job_id,
+        "status": _jobs[job_id]["status"],
+        "sources": [s["name"] for s in sources],
+        "message": f"Export started. Use cme_export_status(job_id='{job_id}') to follow progress.",
+        "_activity": _activity_for_job(job_id, _jobs[job_id]),
+    })]
 
 
 async def _tool_export_cancel(args: dict) -> list[TextContent]:
@@ -632,27 +680,21 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
         job = _jobs.get(job_id)
         if not job:
             return [TextContent(type="text", text=f"Unknown job_id: {job_id}")]
-        lines = [
-            f"job_id: {job_id}",
-            f"status: {job['status']}",
-            f"sources: {', '.join(job.get('sources', []))}",
-            f"started_at: {job.get('started_at', '?')}",
-        ]
-        if job.get("finished_at"):
-            lines.append(f"finished_at: {job['finished_at']}")
-        if job.get("returncode") is not None:
-            lines.append(f"returncode: {job['returncode']}")
-        if job.get("error"):
-            lines.append(f"error: {job['error']}")
         stdout = job.get("stdout", [])
         stderr = job.get("stderr", [])
-        if stdout:
-            lines.append("\n--- stdout (last 20 lines) ---")
-            lines.extend(stdout[-20:])
-        if stderr:
-            lines.append("\n--- stderr (last 20 lines) ---")
-            lines.extend(stderr[-20:])
-        return [TextContent(type="text", text="\n".join(lines))]
+        return [_json_content({
+            "ok": True,
+            "job_id": job_id,
+            "status": job["status"],
+            "sources": job.get("sources", []),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "returncode": job.get("returncode"),
+            "error": job.get("error"),
+            "stdout_tail": stdout[-20:],
+            "stderr_tail": stderr[-20:],
+            "_activity": _activity_for_job(job_id, job),
+        })]
     lock = _lock_summary()
     return [TextContent(type="text", text=yaml.dump(lock, allow_unicode=True, default_flow_style=False))]
 
