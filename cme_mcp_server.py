@@ -45,6 +45,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _MANIFEST = _DATA_DIR / "sources-manifest.yaml"
+_AGENT_VERSION = "0.5.1"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -152,6 +153,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     <section class="panel">
       <dl>
         <dt>Status</dt><dd>Ready</dd>
+        <dt>Version</dt><dd><code>{_escape_html(_AGENT_VERSION)}</code></dd>
         <dt>Endpoint</dt><dd><code>{_escape_html(endpoint_url)}</code></dd>
         <dt>Transport</dt><dd>MCP Streamable HTTP over {_escape_html(scheme.upper())}</dd>
         <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
@@ -452,7 +454,7 @@ async def _tool_status() -> list[TextContent]:
         if creds.get("pat") or creds.get("api_token")
     }
     configured = bool(instances)
-    lines = [f"status: {'configured' if configured else 'not_configured'}"]
+    lines = [f"status: {'configured' if configured else 'not_configured'}", f"version: {_AGENT_VERSION}"]
     if configured:
         for url, info in instances.items():
             lines.append(f"  {url}  auth={info['auth']}")
