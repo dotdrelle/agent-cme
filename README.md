@@ -120,7 +120,7 @@ answer with a plain-text promise to call `cme_setup` later.
 
 ```
 1. cme_status          → "not_configured — call cme_setup"
-2. cme_setup(...)      → credentials + connection settings written to /data/cme/app_data.json
+2. cme_setup(...)      → credentials + connection settings + export.attachments_export=disabled written to /data/cme/app_data.json
 3. cme_sources_list()  → inspect runtime sources from /data/sources-manifest.yaml
 4. cme_source_add(...) → add/update sources if needed
 5. cme_export_run(...) → async export started, returns JSON with `job_id` and `_activity`
