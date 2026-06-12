@@ -45,7 +45,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _MANIFEST = _DATA_DIR / "sources-manifest.yaml"
-_AGENT_VERSION = "0.5.15"
+_AGENT_VERSION = "0.5.17"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
