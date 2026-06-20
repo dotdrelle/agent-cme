@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY cme_mcp_server.py .
 
 ENV CME_DATA_DIR=/data
-ENV CME_CONFIG_PATH=/data/cme/app_data.json
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8080
 

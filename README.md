@@ -2,12 +2,13 @@
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
 
-MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME once, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
+MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME per workspace, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
-`agent-cme` is the exporter only. By default, standalone runs write Markdown
-exports under `data/exports/`. When launched by `llm-wiki-manager`, the manager
-mounts a specific workspace so exports land directly in that workspace's
-`raw/untracked/` directory.
+`agent-cme` is the exporter only. One global instance serves all workspaces:
+credentials, source manifests, and exports are isolated per workspace. When
+managed by `llm-wiki-manager`, the active workspace is injected automatically
+on every tool call — orchestrators never pass `workspace` explicitly. Each
+workspace's export output lands directly in its `raw/untracked/` directory.
 
 It belongs to a three-repository toolchain:
 
@@ -15,11 +16,11 @@ It belongs to a three-repository toolchain:
 | ---------- | ---- |
 | [`agent-cme`](https://github.com/dotdrelle/agent-cme) | Confluence Markdown exporter and MCP server |
 | [`llm-wiki`](https://github.com/dotdrelle/llm-wiki) | Local wiki workspace engine that ingests Markdown and builds deliverables |
-| [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces and workspace-scoped CME agents |
+| [`llm-wiki-manager`](https://github.com/dotdrelle/llm-wiki-manager) | Orchestrates several wiki workspaces; starts agents globally via `wiki-workspace agents up` |
 
 Do not hard-code workspace paths inside `agent-cme`. The agent always works with
-its container paths (`/data` and `/data/exports`); the manager decides which
-workspace those paths map to.
+container paths (`/data` and `/workspaces`); the `workspace` tool argument
+selects the target, validated by the guardian before any file is written.
 
 ## Architecture
 
@@ -29,14 +30,14 @@ Orchestrating agent (Claude or other)
         ▼
   agent-cme MCP server  (port 3000)
         │
-        ├── /data/cme/app_data.json   ← CME credentials + connection settings (persistent)
-        ├── /data/sources-manifest.yaml ← export sources managed by agent (persistent)
-        └── /data/exports/            ← exported markdown files + CME lock file (persistent)
+        ├── /data/<workspace>/cme/app_data.json      ← CME credentials + connection settings
+        ├── /data/<workspace>/sources-manifest.yaml  ← export sources managed by agent
+        └── /workspaces/<workspace>/raw/untracked/   ← exported Markdown output
 ```
 
 All runtime state lives in `./data/` on the host, mounted as a Docker volume.
-No export source is versioned in Git. On first startup, agent-cme creates an empty
-runtime manifest at `./data/sources-manifest.yaml` if it does not already exist.
+No export source is versioned in Git. On first use for a workspace, agent-cme
+creates `./data/<workspace>/sources-manifest.yaml` if it does not already exist.
 MCP edits are persisted there and are not overwritten on later restarts.
 
 ---
@@ -46,12 +47,12 @@ MCP edits are persisted there and are not overwritten on later restarts.
 ### Standalone
 
 ```bash
-cd agent-cme
+cd agent-external/agent-cme
 
-docker compose up --build
+WORKSPACES_ROOT=/path/to/workspaces docker compose up --build
 ```
 
-The MCP endpoint starts on `http://localhost:3000/mcp/`.
+The MCP endpoint starts on `http://localhost:3336/mcp/`.
 Opening that URL in a browser shows a status page. MCP clients use the same URL
 for Streamable HTTP requests.
 
@@ -61,23 +62,39 @@ server. Clients must then send `Authorization: Bearer <generated-local-token>`.
 
 ### From `llm-wiki-manager`
 
-When this repository is used alongside `llm-wiki-manager`, start a
-workspace-scoped CME MCP server from the manager directory:
+When this repository is used alongside `llm-wiki-manager`, start all external
+agents together from the manager directory:
 
 ```bash
-cd ../llm-wiki-manager
-./wiki-workspace cme <workspace> up
+# manager/.env must have WORKSPACES_ROOT and CME_MCP_AUTH_TOKEN set
+wiki-workspace agents up
 ```
 
-The manager compose mounts:
+This uses `agents.docker-compose.yml` and starts CME, documents, and mailer as
+a single stack. Register the endpoint in `mcp.endpoints.json` using `${VAR}`
+interpolation so the token is never hard-coded:
 
-```text
-<workspace>/.cme          -> /data
-<workspace>/raw/untracked -> /data/exports
+```json
+{
+  "mcpServers": {
+    "cme": {
+      "url": "http://host.docker.internal:${CME_MCP_PORT:-3336}/mcp/",
+      "headers": { "Authorization": "Bearer ${CME_MCP_AUTH_TOKEN}" }
+    }
+  }
+}
 ```
 
-So credentials and source manifests are stored under `<workspace>/.cme/`, while
-exported Markdown is written directly to `<workspace>/raw/untracked/`.
+Credentials and source manifests are stored per workspace under
+`.agents-data/cme/<workspace>/`. For example:
+
+```txt
+.agents-data/cme/juno/cme/app_data.json
+.agents-data/cme/juno/sources-manifest.yaml
+```
+
+Each `cme_export_run(workspace="my-project")` writes Markdown directly to
+`/workspaces/my-project/raw/untracked/`.
 
 ### CLI one-shot (`cli` profile)
 
@@ -85,25 +102,16 @@ Configure CME directly from the command line without going through an MCP agent:
 
 ```bash
 # configure credentials interactively
-docker compose run --rm cme-cli config
+CME_WORKSPACE=juno docker compose run --rm cme-cli config
 
 # run an export manually
-docker compose run --rm cme-cli export
+CME_WORKSPACE=juno docker compose run --rm cme-cli export
 ```
 
-The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Credentials written by `cme config` are immediately visible to the MCP server.
+The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Set `CME_WORKSPACE` so credentials are written under `./data/<workspace>/cme/app_data.json`; they are immediately visible to the MCP server for that workspace.
 
-From the manager compose file (`llm-wiki-manager/`), prefer the workspace-scoped
-MCP service:
-
-```bash
-cd ../llm-wiki-manager
-./wiki-workspace cme <workspace> up
-```
-
-The manager's `cme-cli` profile is still available for debugging, but it must be
-run with a workspace `.env` so `WIKI_WORKSPACE_PATH` points at the intended
-workspace.
+Register the running endpoint in `llm-wiki-manager/mcp.endpoints.json` as
+`cme`; the manager and served chat UI load it as an external MCP endpoint.
 
 ---
 
@@ -118,14 +126,29 @@ An orchestrator should either call it in the same turn, ask for missing required
 credentials, or report that the CME tool/server is unavailable. It should not
 answer with a plain-text promise to call `cme_setup` later.
 
+**Via `llm-wiki-manager`** — `workspace` is injected automatically by Donna;
+the active `/use <workspace>` is set once and applies to every call below:
+
 ```
 1. cme_status          → "not_configured — call cme_setup"
-2. cme_setup(...)      → credentials + connection settings + export.attachments_export=disabled written to /data/cme/app_data.json
-3. cme_sources_list()  → inspect runtime sources from /data/sources-manifest.yaml
+2. cme_setup(...)      → credentials + settings written for active workspace
+3. cme_sources_list()  → inspect runtime sources for active workspace
 4. cme_source_add(...) → add/update sources if needed
-5. cme_export_run(...) → async export started, returns JSON with `job_id` and `_activity`
+5. cme_export_run()    → async export started, returns JSON with `job_id` and `_activity`
 6. cme_export_status(job_id=...) → monitor progress, returns JSON with `_activity`
 7. cme_export_cancel(job_id=...) → cancel a running export when needed
+```
+
+**Direct MCP / standalone** — pass `workspace` explicitly on every call:
+
+```
+1. cme_status(workspace="juno")
+2. cme_setup(workspace="juno", ...)
+3. cme_sources_list(workspace="juno")
+4. cme_source_add(workspace="juno", ...)
+5. cme_export_run(workspace="juno")
+6. cme_export_status(job_id=...)
+7. cme_export_cancel(job_id=...)
 ```
 
 On subsequent restarts: `cme_status` returns `configured` and the agent skips straight to step 3+.
@@ -136,12 +159,12 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 
 | Tool                | Description                                                                              |
 | ------------------- | ---------------------------------------------------------------------------------------- |
-| `cme_status`        | Check if CME is configured. Always call this first.                                      |
-| `cme_setup`         | One-time initialization: credentials + connection settings.                              |
-| `cme_sources_list`  | List all configured export sources.                                                      |
-| `cme_source_add`    | Add or update an export source (space, page, or page-with-descendants).                  |
-| `cme_source_remove` | Remove an export source by name.                                                         |
-| `cme_export_run`    | Start an async export. Returns JSON with `job_id`, status, sources, and `_activity`.      |
+| `cme_status`        | Check if CME is configured for one workspace. Always call this first.                    |
+| `cme_setup`         | Workspace initialization: credentials + connection settings.                             |
+| `cme_sources_list`  | List configured export sources for one workspace.                                       |
+| `cme_source_add`    | Add or update a workspace export source (space, page, or page-with-descendants).         |
+| `cme_source_remove` | Remove a workspace export source by name.                                                |
+| `cme_export_run`    | Start an async workspace export. Returns JSON with `job_id`, status, sources, and `_activity`. |
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
 | `cme_export_status` | Check job progress, or show last-export summary. With `job_id`, returns `_activity`.      |
 
@@ -174,6 +197,7 @@ CME-specific response details:
 
 | Parameter    | Type    | Required | Description                                                    |
 | ------------ | ------- | -------- | -------------------------------------------------------------- |
+| `workspace`  | string  | yes      | Workspace name; config is stored under `/data/<workspace>/cme/` |
 | `base_url`   | string  | yes      | Confluence base URL, e.g. `http://confluence.example.com`      |
 | `username`   | string  | yes      | Confluence email address or login                              |
 | `pat`        | string  | no       | Personal Access Token (self-hosted)                            |
@@ -190,6 +214,7 @@ for self-hosted Confluence, or `api_token` for Atlassian Cloud. `base_url` and
 
 | Parameter     | Type   | Required          | Description                    |
 | ------------- | ------ | ----------------- | ------------------------------ |
+| `workspace`   | string | yes               | Workspace name                 |
 | `name`        | string | yes               | Short identifier               |
 | `type`        | string | no                | `space` (default), `page`, or `page-with-descendants` |
 | `base_url`    | string | if `type=space`   | Confluence base URL            |
@@ -318,7 +343,9 @@ python3 -m venv .cme
 # CME_DATA_DIR defaults to agent-cme/
 ```
 
-CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not set:
+CME credentials are read from a workspace-specific `CME_CONFIG_PATH` during MCP
+tool calls. If you run the underlying `cme` binary manually without setting it,
+the binary falls back to its default OS path:
 
 - macOS: `~/Library/Application Support/confluence-markdown-exporter/app_data.json`
 - Linux: `~/.config/confluence-markdown-exporter/app_data.json`
@@ -329,11 +356,10 @@ CME credentials are read from the default OS path if `CME_CONFIG_PATH` is not se
 
 ```
 agent-cme/data/               ← mounted at /data in the container
-├── cme/
-│   └── app_data.json        ← CME credentials + settings (written by cme_setup)
-├── sources-manifest.yaml    ← runtime export sources (created empty, then managed by agent)
-└── exports/                 ← exported markdown files
-    └── confluence-lock.json ← CME lock file (written by CME during export)
+└── juno/
+    ├── cme/
+    │   └── app_data.json        ← CME credentials + settings for juno
+    └── sources-manifest.yaml    ← runtime export sources for juno
 ```
 
 `data/` is gitignored — it contains credentials and generated content.

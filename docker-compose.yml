@@ -2,31 +2,32 @@ services:
   cme-mcp:
     build: .
     ports:
-      - "${CME_MCP_PORT:-3000}:8080"
+      - "${CME_MCP_PORT:-3336}:8080"
     environment:
       - MCP_AUTH_TOKEN=${CME_MCP_AUTH_TOKEN:-}
-      # Répertoire de sortie des exports CME dans le container
-      - CME_EXPORT__OUTPUT_PATH=/data/exports
+      - WORKSPACES_ROOT=/workspaces
       # HTTPS — décommenter et fournir les fichiers dans ./certs/
       #- MCP_SSL_CERTFILE=/certs/server.crt
       #- MCP_SSL_KEYFILE=/certs/server.key
     volumes:
       # État runtime : credentials, manifest, lock, exports
       - ./data:/data
+      - ${WORKSPACES_ROOT:?Set WORKSPACES_ROOT to the directory containing all workspaces}:/workspaces
       # Certificats HTTPS — décommenter si MCP_SSL_CERTFILE est renseigné
       #- ./certs:/certs:ro
     restart: unless-stopped
 
   # CLI one-shot pour configurer CME directement (profil cli).
   # Exemples :
-  #   docker compose run --rm cme-cli configure
-  #   docker compose run --rm cme-cli export
+  #   CME_WORKSPACE=juno docker compose run --rm cme-cli configure
+  #   CME_WORKSPACE=juno docker compose run --rm cme-cli export
   cme-cli:
     build: .
     profiles: [cli]
     entrypoint: cme
     environment:
-      - CME_CONFIG_PATH=/data/cme/app_data.json
-      - CME_EXPORT__OUTPUT_PATH=/data/exports
+      - CME_CONFIG_PATH=/data/${CME_WORKSPACE:-__set_CME_WORKSPACE__}/cme/app_data.json
+      - WORKSPACES_ROOT=/workspaces
     volumes:
       - ./data:/data
+      - ${WORKSPACES_ROOT:?Set WORKSPACES_ROOT to the directory containing all workspaces}:/workspaces

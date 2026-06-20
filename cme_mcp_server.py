@@ -36,6 +36,7 @@ from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 import uvicorn
 
+from confluence_markdown_exporter.utils import app_data_store
 from confluence_markdown_exporter.utils.app_data_store import (
     get_settings,
     set_setting,
@@ -44,8 +45,8 @@ from confluence_markdown_exporter.utils.app_data_store import (
 
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
-_MANIFEST = _DATA_DIR / "sources-manifest.yaml"
-_AGENT_VERSION = "0.5.21"
+_WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
+_AGENT_VERSION = "0.6.8"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -158,12 +159,13 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         <dt>Transport</dt><dd>MCP Streamable HTTP over {_escape_html(scheme.upper())}</dd>
         <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
         <dt>Data directory</dt><dd><code>{_escape_html(str(_DATA_DIR))}</code></dd>
+        <dt>Workspaces root</dt><dd><code>{_escape_html(str(_WORKSPACES_ROOT))}</code></dd>
       </dl>
     </section>
     <section class="panel">
       <h2>Available tools</h2>
       <ul>{tools}</ul>
-      <p class="note">First-run workflow: call <code>cme_status</code>, then <code>cme_setup</code> if credentials are not configured. Export jobs can be cancelled with <code>cme_export_cancel</code>; files already written before cancellation are left in place.</p>
+      <p class="note">First-run workflow: call <code>cme_status(workspace=...)</code>, then <code>cme_setup(workspace=...)</code> if credentials are not configured. Export jobs can be cancelled with <code>cme_export_cancel</code>; files already written before cancellation are left in place.</p>
     </section>
   </main>
 </body>
@@ -189,10 +191,69 @@ def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"success", "failed", "error", "cancelled", "canceled", "done", "completed"}
 
 
+def _validate_workspace(name: str) -> Path:
+    value = str(name or "").strip()
+    if not value or "/" in value or "\\" in value or value in {".", ".."} or ".." in value:
+        raise ValueError(f"Invalid workspace: {name}")
+    path = (_WORKSPACES_ROOT / value).resolve()
+    try:
+        path.relative_to(_WORKSPACES_ROOT)
+    except ValueError as exc:
+        raise ValueError("Path traversal attempt") from exc
+    if not path.is_dir():
+        raise ValueError(f"Unknown workspace: {value}")
+    return path
+
+
+def _workspace_name(name: str) -> str:
+    _validate_workspace(name)
+    return str(name or "").strip()
+
+
+def _workspace_data_dir(workspace: str) -> Path:
+    value = _workspace_name(workspace)
+    path = (_DATA_DIR / value).resolve()
+    try:
+        path.relative_to(_DATA_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError("Data path traversal attempt") from exc
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _workspace_manifest(workspace: str) -> Path:
+    return _workspace_data_dir(workspace) / "sources-manifest.yaml"
+
+
+def _workspace_cme_config(workspace: str) -> Path:
+    return _workspace_data_dir(workspace) / "cme" / "app_data.json"
+
+
+@contextlib.contextmanager
+def _cme_workspace_context(workspace: str):
+    config_path = _workspace_cme_config(workspace)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    old_value = os.environ.get("CME_CONFIG_PATH")
+    old_app_config_path = app_data_store.APP_CONFIG_PATH
+    os.environ["CME_CONFIG_PATH"] = str(config_path)
+    app_data_store.APP_CONFIG_PATH = config_path
+    try:
+        yield _workspace_data_dir(workspace)
+    finally:
+        app_data_store.APP_CONFIG_PATH = old_app_config_path
+        if old_value is None:
+            os.environ.pop("CME_CONFIG_PATH", None)
+        else:
+            os.environ["CME_CONFIG_PATH"] = old_value
+
+
 def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "running")
     sources = job.get("sources") or []
+    workspace = job.get("workspace")
     label = f"CME export · {status}"
+    if workspace:
+        label = f"{label} · {workspace}"
     if sources:
         label = f"{label} · {', '.join(str(source) for source in sources[:3])}"
         if len(sources) > 3:
@@ -225,25 +286,28 @@ def _json_content(payload: dict[str, Any]) -> TextContent:
     return TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def _load_manifest() -> dict:
-    _init_manifest_if_missing()
-    if not _MANIFEST.exists():
+def _load_manifest(workspace: str) -> dict:
+    manifest_path = _workspace_manifest(workspace)
+    _init_manifest_if_missing(workspace)
+    if not manifest_path.exists():
         return {"exports": []}
-    with _MANIFEST.open() as f:
+    with manifest_path.open() as f:
         return yaml.safe_load(f) or {"exports": []}
 
 
-def _save_manifest(data: dict) -> None:
-    _MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    with _MANIFEST.open("w") as f:
+def _save_manifest(workspace: str, data: dict) -> None:
+    manifest_path = _workspace_manifest(workspace)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w") as f:
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
 
 
-def _init_manifest_if_missing() -> None:
+def _init_manifest_if_missing(workspace: str) -> None:
     """Create the writable runtime manifest once, without versioned source data."""
-    if _MANIFEST.exists():
+    manifest_path = _workspace_manifest(workspace)
+    if manifest_path.exists():
         return
-    _save_manifest({"exports": []})
+    _save_manifest(workspace, {"exports": []})
 
 
 def _source_url(source: dict) -> str:
@@ -252,9 +316,9 @@ def _source_url(source: dict) -> str:
     return f"{source['base_url'].rstrip('/')}/display/{source['space']}"
 
 
-def _lock_summary() -> dict:
+def _lock_summary(output_path: Path | None = None) -> dict:
     settings = get_settings()
-    lock_path = settings.export.output_path / settings.export.lockfile_name
+    lock_path = (output_path or settings.export.output_path) / settings.export.lockfile_name
     if not lock_path.exists():
         return {"status": "no_lock_file", "path": str(lock_path)}
     with open(lock_path) as f:
@@ -278,13 +342,19 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_status",
             description=(
-                "Check agent-cme runtime configuration and readiness. "
+                "Check agent-cme runtime configuration and readiness for one workspace. "
                 "Use this for questions about the agent-cme agent/server config, Confluence credentials, SSL/API mode, or last export state. "
                 "Do not use wiki tools for live agent-cme configuration. "
                 "Call this first — returns 'configured' or 'not_configured'. "
                 "If not_configured, call cme_setup before doing anything else."
             ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Config is stored under /data/<workspace>/cme/."},
+                },
+                "required": ["workspace"],
+            },
         ),
         Tool(
             name="cme_setup",
@@ -298,6 +368,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Config is stored under /data/<workspace>/cme/."},
                     "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.meteo.fr"},
                     "username": {"type": "string", "description": "Confluence email address or login"},
                     "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
@@ -310,7 +381,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Which page attachments to download during export (default: disabled).",
                     },
                 },
-                "required": ["base_url", "username"],
+                "required": ["workspace", "base_url", "username"],
             },
         ),
         Tool(
@@ -320,7 +391,13 @@ async def list_tools() -> list[Tool]:
                 "Use this for questions about which Confluence spaces/pages the agent-cme agent exports. "
                 "Do not use llm-wiki source listing tools for this runtime manifest."
             ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are read from /data/<workspace>/sources-manifest.yaml."},
+                },
+                "required": ["workspace"],
+            },
         ),
         Tool(
             name="cme_source_add",
@@ -334,6 +411,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are written under /data/<workspace>/."},
                     "name": {"type": "string", "description": "Short identifier, e.g. 'juno'"},
                     "type": {"type": "string", "enum": ["space", "page", "page-with-descendants"], "description": "Export type (default: space)"},
                     "base_url": {"type": "string", "description": "Confluence base URL (required for type=space)"},
@@ -341,7 +419,7 @@ async def list_tools() -> list[Tool]:
                     "url": {"type": "string", "description": "Full page URL (required for type=page or type=page-with-descendants)"},
                     "description": {"type": "string", "description": "Human description of this source"},
                 },
-                "required": ["name"],
+                "required": ["workspace", "name"],
             },
         ),
         Tool(
@@ -353,9 +431,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are removed from /data/<workspace>/sources-manifest.yaml."},
                     "name": {"type": "string", "description": "Name of the source to remove"},
                 },
-                "required": ["name"],
+                "required": ["workspace", "name"],
             },
         ),
         Tool(
@@ -373,8 +452,9 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "source_name": {"type": "string", "description": "Source name to export. If omitted, exports all sources."},
+                    "workspace": {"type": "string", "description": "Target workspace name. Output is written to <workspace>/raw/untracked."},
                 },
-                "required": [],
+                "required": ["workspace"],
             },
         ),
         Tool(
@@ -402,6 +482,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "job_id": {"type": "string", "description": "Job ID returned by cme_export_run. If omitted, returns lock summary."},
+                    "workspace": {"type": "string", "description": "Optional workspace name for lock summary when job_id is omitted."},
                 },
                 "required": [],
             },
@@ -420,11 +501,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         match name:
             case "cme_status":
-                result = await _tool_status()
+                result = await _tool_status(arguments)
             case "cme_setup":
                 result = await _tool_setup(arguments)
             case "cme_sources_list":
-                result = await _tool_sources_list()
+                result = await _tool_sources_list(arguments)
             case "cme_source_add":
                 result = await _tool_source_add(arguments)
             case "cme_source_remove":
@@ -447,8 +528,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise
 
 
-async def _tool_status() -> list[TextContent]:
-    settings = get_settings()
+async def _tool_status(args: dict) -> list[TextContent]:
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    with _cme_workspace_context(workspace):
+        settings = get_settings()
     data = json.loads(settings.model_dump_json())
     confluence = data.get("auth", {}).get("confluence", {})
     instances = {
@@ -459,7 +542,14 @@ async def _tool_status() -> list[TextContent]:
         if creds.get("pat") or creds.get("api_token")
     }
     configured = bool(instances)
-    lines = [f"status: {'configured' if configured else 'not_configured'}", f"version: {_AGENT_VERSION}"]
+    lines = [
+        f"status: {'configured' if configured else 'not_configured'}",
+        f"version: {_AGENT_VERSION}",
+        f"workspace: {workspace}",
+        f"workspaces_root: {_WORKSPACES_ROOT}",
+        f"data_dir: {_workspace_data_dir(workspace)}",
+        f"config_path: {_workspace_cme_config(workspace)}",
+    ]
     if configured:
         for url, info in instances.items():
             lines.append(f"  {url}  auth={info['auth']}")
@@ -467,7 +557,8 @@ async def _tool_status() -> list[TextContent]:
         lines.append(f"verify_ssl: {conn.get('verify_ssl', True)}")
         lines.append(f"use_v2_api: {conn.get('use_v2_api', False)}")
         lines.append(f"attachments_export: {data.get('export', {}).get('attachments_export', 'disabled')}")
-        lock = _lock_summary()
+        with _cme_workspace_context(workspace):
+            lock = _lock_summary()
         if lock.get("last_export"):
             lines.append(f"last_export: {lock['last_export']}")
     else:
@@ -476,6 +567,7 @@ async def _tool_status() -> list[TextContent]:
 
 
 async def _tool_setup(args: dict) -> list[TextContent]:
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
     base_url: str = args["base_url"].rstrip("/")
     username: str = str(args.get("username", "")).strip()
     pat: str = args.get("pat", "")
@@ -488,39 +580,49 @@ async def _tool_setup(args: dict) -> list[TextContent]:
             return [TextContent(type="text", text="Error: username is required. Provide the Confluence email address or login.")]
         if attachments_export not in {"referenced", "all", "disabled"}:
             return [TextContent(type="text", text="Error: attachments_export must be one of: referenced, all, disabled.")]
-        if os.environ.get("CME_CONFIG_PATH"):
-            Path(os.environ["CME_CONFIG_PATH"]).parent.mkdir(parents=True, exist_ok=True)
-        set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
-        if pat:
-            set_setting_with_keys(["auth", "confluence", base_url, "pat"], pat)
-        if api_token:
-            set_setting_with_keys(["auth", "confluence", base_url, "api_token"], api_token)
-        set_setting("connection_config.verify_ssl", verify_ssl)
-        set_setting("connection_config.use_v2_api", use_v2_api)
-        set_setting("export.attachments_export", attachments_export)
+        with _cme_workspace_context(workspace):
+            set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
+            if pat:
+                set_setting_with_keys(["auth", "confluence", base_url, "pat"], pat)
+            if api_token:
+                set_setting_with_keys(["auth", "confluence", base_url, "api_token"], api_token)
+            set_setting("connection_config.verify_ssl", verify_ssl)
+            set_setting("connection_config.use_v2_api", use_v2_api)
+            set_setting("export.attachments_export", attachments_export)
         fields = [f for f in ("username", "pat", "api_token") if args.get(f)]
         return [TextContent(type="text", text=(
             f"OK: CME configured\n"
+            f"workspace: {workspace}\n"
             f"instance: {base_url}\n"
             f"credentials: {', '.join(fields)}\n"
             f"verify_ssl: {verify_ssl}\n"
             f"use_v2_api: {use_v2_api}\n"
             f"attachments_export: {attachments_export}\n"
-            f"Config persisted — no reconfiguration needed on restart."
+            f"config_path: {_workspace_cme_config(workspace)}\n"
+            f"Config persisted for this workspace — no reconfiguration needed on restart."
         ))]
     except (ValueError, KeyError, TypeError) as e:
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
-async def _tool_sources_list() -> list[TextContent]:
-    manifest = _load_manifest()
-    lock = _lock_summary()
-    result = {"manifest_path": str(_MANIFEST), "sources": manifest.get("exports", []), "lock": lock}
+async def _tool_sources_list(args: dict) -> list[TextContent]:
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    manifest = _load_manifest(workspace)
+    with _cme_workspace_context(workspace):
+        lock = _lock_summary()
+    result = {
+        "workspace": workspace,
+        "manifest_path": str(_workspace_manifest(workspace)),
+        "config_path": str(_workspace_cme_config(workspace)),
+        "sources": manifest.get("exports", []),
+        "lock": lock,
+    }
     return [TextContent(type="text", text=yaml.dump(result, allow_unicode=True, default_flow_style=False))]
 
 
 async def _tool_source_add(args: dict) -> list[TextContent]:
-    manifest = _load_manifest()
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    manifest = _load_manifest(workspace)
     exports: list = manifest.setdefault("exports", [])
     name = args["name"]
     source_type = args.get("type", "space")
@@ -546,24 +648,32 @@ async def _tool_source_add(args: dict) -> list[TextContent]:
         action = "added"
     else:
         action = "updated"
-    _save_manifest(manifest)
-    return [TextContent(type="text", text=f"OK: source '{name}' {action} in {_MANIFEST}")]
+    _save_manifest(workspace, manifest)
+    return [TextContent(type="text", text=f"OK: source '{name}' {action} in {_workspace_manifest(workspace)}")]
 
 
 async def _tool_source_remove(args: dict) -> list[TextContent]:
-    manifest = _load_manifest()
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    manifest = _load_manifest(workspace)
     exports: list = manifest.get("exports", [])
     name = args["name"]
     before = len(exports)
     manifest["exports"] = [e for e in exports if e.get("name") != name]
     if len(manifest["exports"]) == before:
         return [TextContent(type="text", text=f"Error: source '{name}' not found")]
-    _save_manifest(manifest)
+    _save_manifest(workspace, manifest)
     return [TextContent(type="text", text=f"OK: source '{name}' removed")]
 
 
 async def _tool_export_run(args: dict) -> list[TextContent]:
-    manifest = _load_manifest()
+    workspace = str(args.get("workspace", "")).strip()
+    workspace_path = _validate_workspace(workspace)
+    workspace_data_dir = _workspace_data_dir(workspace)
+    cme_config_path = _workspace_cme_config(workspace)
+    output_path = workspace_path / "raw" / "untracked"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    manifest = _load_manifest(workspace)
     exports: list = manifest.get("exports", [])
     source_name = args.get("source_name")
     if source_name:
@@ -582,6 +692,10 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
         "status": "starting",
+        "workspace": workspace,
+        "data_path": str(workspace_data_dir),
+        "config_path": str(cme_config_path),
+        "output_path": str(output_path),
         "sources": [s["name"] for s in sources],
         "started_at": _now(),
         "stdout": [],
@@ -592,11 +706,17 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     }
 
     async def _run_cmd(cmd: list[str]) -> int:
+        env = {
+            **os.environ,
+            "CME_CONFIG_PATH": str(cme_config_path),
+            "CME_EXPORT__OUTPUT_PATH": str(output_path),
+        }
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(_DATA_DIR),
+            cwd=str(workspace_data_dir),
+            env=env,
         )
         _jobs[job_id]["process"] = proc
         async def _read(stream: asyncio.StreamReader, buf: list) -> None:
@@ -652,6 +772,8 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "ok": True,
         "job_id": job_id,
         "status": _jobs[job_id]["status"],
+        "workspace": workspace,
+        "outputPath": str(output_path),
         "sources": [s["name"] for s in sources],
         "message": f"Export started. Use cme_export_status(job_id='{job_id}') to follow progress.",
         "_activity": _activity_for_job(job_id, _jobs[job_id]),
@@ -699,6 +821,10 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             "ok": True,
             "job_id": job_id,
             "status": job["status"],
+            "workspace": job.get("workspace"),
+            "dataPath": job.get("data_path"),
+            "configPath": job.get("config_path"),
+            "outputPath": job.get("output_path"),
             "sources": job.get("sources", []),
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
@@ -708,7 +834,17 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             "stderr_tail": stderr[-20:],
             "_activity": _activity_for_job(job_id, job),
         })]
-    lock = _lock_summary()
+    workspace = str(args.get("workspace", "") or "").strip()
+    output_path = None
+    if workspace:
+        output_path = _validate_workspace(workspace) / "raw" / "untracked"
+        with _cme_workspace_context(workspace):
+            lock = _lock_summary(output_path)
+    else:
+        lock = {
+            "status": "workspace_required",
+            "message": "Provide workspace when job_id is omitted.",
+        }
     return [TextContent(type="text", text=yaml.dump(lock, allow_unicode=True, default_flow_style=False))]
 
 
@@ -717,7 +853,6 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    _init_manifest_if_missing()
     streamable_http = StreamableHTTPSessionManager(
         app=app,
         event_store=None,
