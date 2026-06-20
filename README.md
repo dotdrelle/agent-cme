@@ -89,11 +89,11 @@ Credentials and source manifests are stored per workspace under
 `.agents-data/cme/<workspace>/`. For example:
 
 ```txt
-.agents-data/cme/juno/cme/app_data.json
-.agents-data/cme/juno/sources-manifest.yaml
+.agents-data/cme/my-project/cme/app_data.json
+.agents-data/cme/my-project/sources-manifest.yaml
 ```
 
-Each `cme_export_run(workspace="my-project")` writes Markdown directly to
+Each `cme_export_run()` for the active workspace writes Markdown directly to
 `/workspaces/my-project/raw/untracked/`.
 
 ### CLI one-shot (`cli` profile)
@@ -102,10 +102,10 @@ Configure CME directly from the command line without going through an MCP agent:
 
 ```bash
 # configure credentials interactively
-CME_WORKSPACE=juno docker compose run --rm cme-cli config
+CME_WORKSPACE=my-project docker compose run --rm cme-cli config
 
 # run an export manually
-CME_WORKSPACE=juno docker compose run --rm cme-cli export
+CME_WORKSPACE=my-project docker compose run --rm cme-cli export
 ```
 
 The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Set `CME_WORKSPACE` so credentials are written under `./data/<workspace>/cme/app_data.json`; they are immediately visible to the MCP server for that workspace.
@@ -142,11 +142,11 @@ the active `/use <workspace>` is set once and applies to every call below:
 **Direct MCP / standalone** — pass `workspace` explicitly on every call:
 
 ```
-1. cme_status(workspace="juno")
-2. cme_setup(workspace="juno", ...)
-3. cme_sources_list(workspace="juno")
-4. cme_source_add(workspace="juno", ...)
-5. cme_export_run(workspace="juno")
+1. cme_status(workspace="my-project")
+2. cme_setup(workspace="my-project", ...)
+3. cme_sources_list(workspace="my-project")
+4. cme_source_add(workspace="my-project", ...)
+5. cme_export_run(workspace="my-project")
 6. cme_export_status(job_id=...)
 7. cme_export_cancel(job_id=...)
 ```
@@ -356,10 +356,10 @@ the binary falls back to its default OS path:
 
 ```
 agent-cme/data/               ← mounted at /data in the container
-└── juno/
+└── my-project/
     ├── cme/
-    │   └── app_data.json        ← CME credentials + settings for juno
-    └── sources-manifest.yaml    ← runtime export sources for juno
+    │   └── app_data.json        ← CME credentials + settings
+    └── sources-manifest.yaml    ← runtime export sources
 ```
 
 `data/` is gitignored — it contains credentials and generated content.

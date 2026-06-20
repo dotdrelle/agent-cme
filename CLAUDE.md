@@ -40,8 +40,8 @@ into a local export directory.
   `cme.cme_export_status` without parsing CME-specific text.
 - Keep `agent-cme` workspace-agnostic. Workspace names are request parameters,
   not container configuration. Runtime CME state is namespaced directly under
-  `/data/<workspace>/`, for example `/data/juno/cme/app_data.json` and
-  `/data/juno/sources-manifest.yaml`.
+  `/data/<workspace>/`, for example `/data/my-project/cme/app_data.json` and
+  `/data/my-project/sources-manifest.yaml`.
 - When managed by `llm-wiki-manager`, the active `/use <workspace>` is injected
   automatically on every `cme_*` call (except `cme_export_cancel` and
   `cme_export_status(job_id=...)`). Direct MCP callers must pass `workspace` on
@@ -51,8 +51,8 @@ into a local export directory.
 
 ```bash
 docker compose up --build
-CME_WORKSPACE=juno docker compose run --rm cme-cli config
-CME_WORKSPACE=juno docker compose run --rm cme-cli export
+CME_WORKSPACE=my-project docker compose run --rm cme-cli config
+CME_WORKSPACE=my-project docker compose run --rm cme-cli export
 ```
 
 When managed by `llm-wiki-manager`, use the manager's global agent stack:
