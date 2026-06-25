@@ -36,6 +36,7 @@ from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 import uvicorn
 
+from cme_source_urls import extract_confluence_url, parse_confluence_source_url
 from confluence_markdown_exporter.utils import app_data_store
 from confluence_markdown_exporter.utils.app_data_store import (
     get_settings,
@@ -46,7 +47,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.6.11"
+_AGENT_VERSION = "0.6.17"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -406,7 +407,9 @@ async def list_tools() -> list[Tool]:
                 "Use this to configure what agent-cme exports, not to ingest or edit llm-wiki content. "
                 "For type=space: provide base_url + space key. "
                 "For type=page: provide url (full Confluence page URL). "
-                "For type=page-with-descendants: provide url to export that page and all pages below it."
+                "For type=page-with-descendants: provide url to export that page and all pages below it. "
+                "If type is omitted and url is provided, the source type is inferred. "
+                "The url may be raw or a Markdown link."
             ),
             inputSchema={
                 "type": "object",
@@ -416,7 +419,7 @@ async def list_tools() -> list[Tool]:
                     "type": {"type": "string", "enum": ["space", "page", "page-with-descendants"], "description": "Export type (default: space)"},
                     "base_url": {"type": "string", "description": "Confluence base URL (required for type=space)"},
                     "space": {"type": "string", "description": "Space key, e.g. 'JDLCDPPO' (required for type=space)"},
-                    "url": {"type": "string", "description": "Full page URL (required for type=page or type=page-with-descendants)"},
+                    "url": {"type": "string", "description": "Confluence page/space URL or Markdown link. Required for page types; type is inferred when omitted."},
                     "description": {"type": "string", "description": "Human description of this source"},
                 },
                 "required": ["workspace", "name"],
@@ -625,20 +628,49 @@ async def _tool_source_add(args: dict) -> list[TextContent]:
     manifest = _load_manifest(workspace)
     exports: list = manifest.setdefault("exports", [])
     name = args["name"]
-    source_type = args.get("type", "space")
+    source_type = args.get("type")
+    source_url = extract_confluence_url(str(args.get("url", "")))
+    parsed_source: dict[str, str] | None = None
+    if source_url:
+        try:
+            parsed_source = parse_confluence_source_url(source_url)
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"Error: {exc}")]
+    if not source_type:
+        source_type = parsed_source["type"] if parsed_source else "space"
     existing = next((e for e in exports if e.get("name") == name), None)
     entry: dict = existing or {}
     entry["name"] = name
     entry["type"] = source_type
     if source_type in {"page", "page-with-descendants"}:
-        if not args.get("url"):
+        if not source_url:
             return [TextContent(type="text", text=f"Error: 'url' is required for type={source_type}")]
-        entry["url"] = args["url"]
+        if parsed_source and parsed_source["type"] != "page":
+            return [TextContent(type="text", text=f"Error: page source URL points to a Confluence space")]
+        entry.pop("base_url", None)
+        entry.pop("space", None)
+        entry["url"] = source_url
     elif source_type == "space":
-        if not args.get("base_url") or not args.get("space"):
+        base_url = str(args.get("base_url", "")).strip()
+        space = str(args.get("space", "")).strip()
+        if base_url and not space:
+            try:
+                parsed_base_url = parse_confluence_source_url(base_url)
+            except ValueError:
+                parsed_base_url = None
+            if parsed_base_url and parsed_base_url["type"] == "space":
+                base_url = parsed_base_url["base_url"]
+                space = parsed_base_url["space"]
+        if parsed_source:
+            if parsed_source["type"] != "space":
+                return [TextContent(type="text", text="Error: space source URL points to a Confluence page")]
+            base_url = parsed_source["base_url"]
+            space = parsed_source["space"]
+        if not base_url or not space:
             return [TextContent(type="text", text="Error: 'base_url' and 'space' are required for type=space")]
-        entry["base_url"] = args["base_url"]
-        entry["space"] = args["space"]
+        entry.pop("url", None)
+        entry["base_url"] = base_url.rstrip("/")
+        entry["space"] = space
     else:
         return [TextContent(type="text", text=f"Error: unsupported source type '{source_type}'")]
     if args.get("description"):
@@ -685,7 +717,14 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     if not sources:
         return [TextContent(type="text", text="Error: no sources defined. Use cme_source_add first.")]
 
-    space_urls = [_source_url(s) for s in sources if s.get("type", "space") == "space"]
+    space_urls = [
+        url
+        for s in sources if s.get("type", "space") == "space"
+        for url in (
+            f"{s['base_url'].rstrip('/')}/display/{s['space']}",
+            f"{s['base_url'].rstrip('/')}/spaces/{s['space']}",
+        )
+    ]
     page_urls = [_source_url(s) for s in sources if s.get("type", "space") == "page"]
     page_descendant_urls = [_source_url(s) for s in sources if s.get("type", "space") == "page-with-descendants"]
 

@@ -219,8 +219,12 @@ for self-hosted Confluence, or `api_token` for Atlassian Cloud. `base_url` and
 | `type`        | string | no                | `space` (default), `page`, or `page-with-descendants` |
 | `base_url`    | string | if `type=space`   | Confluence base URL            |
 | `space`       | string | if `type=space`   | Confluence space key           |
-| `url`         | string | if `type=page*`   | Full Confluence page URL       |
+| `url`         | string | if `type=page*`   | Full Confluence URL or Markdown link |
 | `description` | string | no                | Human description              |
+
+When `type` is omitted and `url` is provided, CME infers `space` or `page`.
+Supported forms include `/spaces/<key>`, `/spaces/<key>/pages/<id>`,
+`/display/<key>`, and legacy `viewpage.action?pageId=...` URLs.
 
 ---
 

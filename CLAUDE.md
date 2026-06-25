@@ -12,6 +12,10 @@ into a local export directory.
 - `cme_mcp_server.py`: Starlette/uvicorn MCP server, bearer-auth middleware,
   HTML status page, tool definitions, source manifest handling, and async CME
   job execution.
+- `cme_source_urls.py`: URL normalisation helpers (`extract_confluence_url`,
+  `parse_confluence_source_url`). Accepts raw URLs, Markdown links, `/spaces/`,
+  `/display/`, and `pageId=` forms and returns manifest-ready source fields.
+  Used by `cme_mcp_server.py` to infer source type when `type` is omitted.
 - `Dockerfile`: Python runtime with `confluence-markdown-exporter`, MCP,
   Starlette, uvicorn, and PyYAML.
 - `docker-compose.yml`: global service and CLI profile. It mounts the shared

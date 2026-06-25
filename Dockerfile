@@ -5,13 +5,14 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
-    confluence-markdown-exporter \
+    confluence-markdown-exporter==5.2.1 \
     "mcp>=1.9.4" \
     starlette \
     uvicorn \
     pyyaml
 
 COPY cme_mcp_server.py .
+COPY cme_source_urls.py .
 
 ENV CME_DATA_DIR=/data
 ENV MCP_HOST=0.0.0.0
