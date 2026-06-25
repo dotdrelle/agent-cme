@@ -50,6 +50,8 @@ into a local export directory.
   automatically on every `cme_*` call (except `cme_export_cancel` and
   `cme_export_status(job_id=...)`). Direct MCP callers must pass `workspace` on
   each tool call.
+- Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
+  release version so status responses identify the deployed agent bundle.
 
 ## Common Commands
 
