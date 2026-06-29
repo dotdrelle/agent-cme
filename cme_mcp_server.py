@@ -47,7 +47,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.6.34"
+_AGENT_VERSION = "0.6.45"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -352,7 +352,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Config is stored under /data/<workspace>/cme/."},
+                    "workspace": {"type": "string", "description": "Workspace name. Agent configuration is stored in agent state; exports are written to the workspace raw/untracked directory."},
                 },
                 "required": ["workspace"],
             },
@@ -369,7 +369,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Config is stored under /data/<workspace>/cme/."},
+                    "workspace": {"type": "string", "description": "Workspace name. Agent configuration is stored in agent state; exports are written to the workspace raw/untracked directory."},
                     "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.meteo.fr"},
                     "username": {"type": "string", "description": "Confluence email address or login"},
                     "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
@@ -395,7 +395,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Sources are read from /data/<workspace>/sources-manifest.yaml."},
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are read from the agent state manifest for this workspace."},
                 },
                 "required": ["workspace"],
             },
@@ -414,8 +414,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Sources are written under /data/<workspace>/."},
-                    "name": {"type": "string", "description": "Short identifier, e.g. 'juno'"},
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are written to the agent state manifest for this workspace."},
+                    "name": {"type": "string", "description": "Short identifier for this export source."},
                     "type": {"type": "string", "enum": ["space", "page", "page-with-descendants"], "description": "Export type (default: space)"},
                     "base_url": {"type": "string", "description": "Confluence base URL (required for type=space)"},
                     "space": {"type": "string", "description": "Space key, e.g. 'JDLCDPPO' (required for type=space)"},
@@ -434,7 +434,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Sources are removed from /data/<workspace>/sources-manifest.yaml."},
+                    "workspace": {"type": "string", "description": "Workspace name. Sources are removed from the agent state manifest for this workspace."},
                     "name": {"type": "string", "description": "Name of the source to remove"},
                 },
                 "required": ["workspace", "name"],
@@ -733,6 +733,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "status": "starting",
         "workspace": workspace,
         "data_path": str(workspace_data_dir),
+        "workspace_path": str(workspace_path),
         "config_path": str(cme_config_path),
         "output_path": str(output_path),
         "sources": [s["name"] for s in sources],
@@ -812,6 +813,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "job_id": job_id,
         "status": _jobs[job_id]["status"],
         "workspace": workspace,
+        "workspacePath": str(workspace_path),
         "outputPath": str(output_path),
         "sources": [s["name"] for s in sources],
         "message": f"Export started. Use cme_export_status(job_id='{job_id}') to follow progress.",
@@ -861,8 +863,9 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             "job_id": job_id,
             "status": job["status"],
             "workspace": job.get("workspace"),
-            "dataPath": job.get("data_path"),
+            "agentStatePath": job.get("data_path"),
             "configPath": job.get("config_path"),
+            "workspacePath": job.get("workspace_path"),
             "outputPath": job.get("output_path"),
             "sources": job.get("sources", []),
             "started_at": job.get("started_at"),
