@@ -3,7 +3,7 @@
 
 The upstream _CLOUD_URL_RE and _SERVER_URL_RE use narrow character classes
 ([A-Za-z0-9_~-]+ and [A-Za-z0-9._-]+) that reject '.' and '@' in space keys,
-breaking personal spaces whose keys look like ~pascal.poindrelle@meteo.fr.
+breaking personal spaces whose keys look like ~user.name@example.com.
 """
 import glob
 import pathlib

@@ -19,8 +19,8 @@ services:
 
   # CLI one-shot pour configurer CME directement (profil cli).
   # Exemples :
-  #   CME_WORKSPACE=juno docker compose run --rm cme-cli configure
-  #   CME_WORKSPACE=juno docker compose run --rm cme-cli export
+  #   CME_WORKSPACE=my-project docker compose run --rm cme-cli configure
+  #   CME_WORKSPACE=my-project docker compose run --rm cme-cli export
   cme-cli:
     build: .
     profiles: [cli]

@@ -47,7 +47,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.7.1"
+_AGENT_VERSION = "0.7.3"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -370,7 +370,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "workspace": {"type": "string", "description": "Workspace name. Agent configuration is stored in agent state; exports are written to the workspace raw/untracked directory."},
-                    "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.meteo.fr"},
+                    "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.example.com"},
                     "username": {"type": "string", "description": "Confluence email address or login"},
                     "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
                     "api_token": {"type": "string", "description": "API token (Atlassian Cloud)"},
@@ -418,7 +418,7 @@ async def list_tools() -> list[Tool]:
                     "name": {"type": "string", "description": "Short identifier for this export source."},
                     "type": {"type": "string", "enum": ["space", "page", "page-with-descendants"], "description": "Export type (default: space)"},
                     "base_url": {"type": "string", "description": "Confluence base URL (required for type=space)"},
-                    "space": {"type": "string", "description": "Space key, e.g. 'JDLCDPPO' (required for type=space)"},
+                    "space": {"type": "string", "description": "Space key, e.g. 'MYSPACE' (required for type=space)"},
                     "url": {"type": "string", "description": "Confluence page/space URL or Markdown link. Required for page types; type is inferred when omitted."},
                     "description": {"type": "string", "description": "Human description of this source"},
                 },
