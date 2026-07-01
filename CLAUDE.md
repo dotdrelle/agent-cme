@@ -52,7 +52,7 @@ into a local export directory.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.6.47`.
+  Current release line: `0.7.0`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
   and operator-facing errors must stay in English. Exported Confluence content
   keeps the source language; this service does not localize its UI from
