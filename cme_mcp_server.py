@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -182,6 +183,13 @@ def _mask_secrets(data: Any) -> Any:
     if isinstance(data, list):
         return [_mask_secrets(i) for i in data]
     return data
+
+
+def _mask_secret_text(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key|token|secret|password|pat)(['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1\2***", text)
+    return text
 
 
 def _now() -> str:
@@ -527,7 +535,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return result
     except Exception as exc:
         elapsed_ms = round((time.perf_counter() - start) * 1000)
-        print(f"[cme-mcp] tools/result {name} exception {elapsed_ms}ms {exc}")
+        print(f"[cme-mcp] tools/result {name} exception {elapsed_ms}ms {_mask_secret_text(exc)}")
         raise
 
 
