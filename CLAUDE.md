@@ -52,7 +52,7 @@ into a local export directory.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.10.1`. Alignment is checked by
+  Current release line: `0.11.1`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
@@ -97,6 +97,17 @@ deployed Docker images with no shared Python package between them today, so
 extracting one is a real packaging/versioning decision, not a quick fix. If
 that decision is made, keep the fix in whichever of these files is edited
 first in sync with the other three by hand until a shared module exists.
+
+**Multi-user status** (0.11.0): this agent's bearer-token scoping is
+per-token, not per-user — it distinguishes read vs. write access, not one
+caller's workspace/data from another's. 0.11.0 is an industrialized
+single-user deployment baseline across the whole wikiLLM workspace; the
+multi-user model (identity, ownership, per-user scopes/conflicts) is
+specified in `llm-wiki/docs/industrialisation.md` and planned for 0.12.0.
+Until that lands, do not deploy this agent as a shared endpoint serving
+distinct end users who should not see each other's export sources or data —
+treat it as a workspace-scoped service protected by bearer tokens, the same
+posture documented for the manager runtime and `llm-wiki mcp-http`.
 
 For standalone start (without the full agent stack), from this directory:
 
