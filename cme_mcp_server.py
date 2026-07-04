@@ -74,7 +74,11 @@ _RATE_LIMIT_REQUESTS = int(os.environ.get("MCP_RATE_LIMIT_REQUESTS", "120"))
 _RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MCP_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _RATE_BUCKETS: dict[str, list[float]] = {}
 
-if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
+def _any_token_configured() -> bool:
+    return bool(_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN)
+
+
+if not _any_token_configured():
     print("[cme-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
 
 
@@ -84,7 +88,7 @@ def _bearer_token(request: Request) -> str:
 
 
 def _token_scopes(token: str) -> set[str] | None:
-    if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
+    if not _any_token_configured():
         return {"read", "write"}
     if _MCP_TOKEN and hmac.compare_digest(token, _MCP_TOKEN):
         return {"read", "write"}

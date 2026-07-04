@@ -87,6 +87,16 @@ to read-only callers; the current request's scope is threaded through a
 `contextvars.ContextVar` set by `_BearerAuthMiddleware`, not passed
 explicitly. Requests are rate-limited (`MCP_RATE_LIMIT_REQUESTS`/
 `MCP_RATE_LIMIT_WINDOW_SECONDS`, default 120/60s) keyed by token or remote IP.
+`_any_token_configured()` is the single "is any token set" check, used both
+at startup (unauthenticated-access warning) and inside `_token_scopes`; this
+same auth/scope/rate-limit block is copy-pasted near-verbatim into the other
+three agent repos (`agent-mailer-api`, `agent-wiki-documents`,
+`agent-wiki-production`) and again, separately, in `llm-wiki`'s TypeScript
+`mcpHttp.ts` — deliberate, not an oversight: these are four independently
+deployed Docker images with no shared Python package between them today, so
+extracting one is a real packaging/versioning decision, not a quick fix. If
+that decision is made, keep the fix in whichever of these files is edited
+first in sync with the other three by hand until a shared module exists.
 
 For standalone start (without the full agent stack), from this directory:
 
