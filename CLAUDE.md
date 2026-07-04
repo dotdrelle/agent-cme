@@ -52,7 +52,7 @@ into a local export directory.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.9.4`. Alignment is checked by
+  Current release line: `0.10.1`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
@@ -77,6 +77,16 @@ wiki-workspace agents up
 
 This starts CME, documents, and mailer together from `agents.docker-compose.yml`.
 Auth token is read from `CME_MCP_AUTH_TOKEN` in the manager's `.env`.
+
+**Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy
+full-access (read+write) token; `MCP_READ_TOKEN`/`MCP_WRITE_TOKEN` grant
+scoped access instead. `_token_scopes` compares with `hmac.compare_digest`
+(constant-time). `_require_tool_scope` denies `_WRITE_TOOLS` (`cme_setup`,
+`cme_source_add`, `cme_source_remove`, `cme_export_run`, `cme_export_cancel`)
+to read-only callers; the current request's scope is threaded through a
+`contextvars.ContextVar` set by `_BearerAuthMiddleware`, not passed
+explicitly. Requests are rate-limited (`MCP_RATE_LIMIT_REQUESTS`/
+`MCP_RATE_LIMIT_WINDOW_SECONDS`, default 120/60s) keyed by token or remote IP.
 
 For standalone start (without the full agent stack), from this directory:
 

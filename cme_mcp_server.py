@@ -2,7 +2,9 @@
 """CME MCP Server — Streamable HTTP transport for container deployment."""
 
 import asyncio
+import contextvars
 import contextlib
+import hmac
 import json
 import os
 import re
@@ -48,7 +50,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.10.1"
+_AGENT_VERSION = "0.10.4"
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -64,19 +66,74 @@ app = Server("cme")
 # ---------------------------------------------------------------------------
 
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
-if not _MCP_TOKEN:
+_MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
+_MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
+_CURRENT_SCOPES: contextvars.ContextVar[set[str]] = contextvars.ContextVar("mcp_scopes", default={"read", "write"})
+_WRITE_TOOLS = {"cme_setup", "cme_source_add", "cme_source_remove", "cme_export_run", "cme_export_cancel"}
+_RATE_LIMIT_REQUESTS = int(os.environ.get("MCP_RATE_LIMIT_REQUESTS", "120"))
+_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MCP_RATE_LIMIT_WINDOW_SECONDS", "60"))
+_RATE_BUCKETS: dict[str, list[float]] = {}
+
+if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
     print("[cme-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
+
+
+def _bearer_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    return auth[7:] if auth.lower().startswith("bearer ") else ""
+
+
+def _token_scopes(token: str) -> set[str] | None:
+    if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
+        return {"read", "write"}
+    if _MCP_TOKEN and hmac.compare_digest(token, _MCP_TOKEN):
+        return {"read", "write"}
+    if _MCP_WRITE_TOKEN and hmac.compare_digest(token, _MCP_WRITE_TOKEN):
+        return {"read", "write"}
+    if _MCP_READ_TOKEN and hmac.compare_digest(token, _MCP_READ_TOKEN):
+        return {"read"}
+    return None
+
+
+def _require_tool_scope(name: str) -> list[TextContent] | None:
+    if name in _WRITE_TOOLS and "write" not in _CURRENT_SCOPES.get():
+        return [TextContent(type="text", text=f"Error: token does not have write scope for {name}")]
+    return None
+
+
+def _rate_limit_key(request: Request, token: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    host = forwarded or (request.client.host if request.client else "unknown")
+    return f"token:{token}" if token else f"ip:{host}"
+
+
+def _rate_limited(key: str) -> bool:
+    now = time.time()
+    cutoff = now - max(1, _RATE_LIMIT_WINDOW_SECONDS)
+    bucket = [item for item in _RATE_BUCKETS.get(key, []) if item > cutoff]
+    if len(bucket) >= max(1, _RATE_LIMIT_REQUESTS):
+        _RATE_BUCKETS[key] = bucket
+        return True
+    bucket.append(now)
+    _RATE_BUCKETS[key] = bucket
+    return False
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "GET" and _wants_html(request):
             return await call_next(request)
-        if _MCP_TOKEN:
-            auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {_MCP_TOKEN}":
-                return PlainTextResponse("Unauthorized", status_code=401)
-        return await call_next(request)
+        token_value = _bearer_token(request)
+        scopes = _token_scopes(token_value)
+        if scopes is None:
+            return PlainTextResponse("Unauthorized", status_code=401)
+        if _rate_limited(_rate_limit_key(request, token_value)):
+            return PlainTextResponse("Rate limit exceeded", status_code=429)
+        token = _CURRENT_SCOPES.set(scopes)
+        try:
+            return await call_next(request)
+        finally:
+            _CURRENT_SCOPES.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +567,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     start = time.perf_counter()
     print(f"[cme-mcp] tools/call {name}")
     try:
+        denied = _require_tool_scope(name)
+        if denied is not None:
+            return denied
         match name:
             case "cme_status":
                 result = await _tool_status(arguments)

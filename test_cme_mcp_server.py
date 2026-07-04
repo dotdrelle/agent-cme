@@ -158,6 +158,18 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertNotIn("secret", text)
         self.assertNotIn("tok123", text)
 
+    def test_read_scope_cannot_call_mutating_tool(self):
+        token = self.server._CURRENT_SCOPES.set({"read"})
+        try:
+            denied = self.server._require_tool_scope("cme_export_run")
+            allowed = self.server._require_tool_scope("cme_status")
+        finally:
+            self.server._CURRENT_SCOPES.reset(token)
+
+        self.assertIsNotNone(denied)
+        self.assertIn("write scope", denied[0].text)
+        self.assertIsNone(allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

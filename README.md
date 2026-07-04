@@ -275,6 +275,12 @@ claude mcp add --transport http cme http://localhost:3000/mcp/ \
   --header "Authorization: Bearer <generated-local-token>"
 ```
 
+For scoped HTTP access, set `MCP_READ_TOKEN` for status/list clients and
+`MCP_WRITE_TOKEN` for clients allowed to configure sources or start/cancel
+exports. `MCP_AUTH_TOKEN` remains a legacy full-access read+write token. Rate
+limiting defaults to 120 requests per 60 seconds and can be tuned with
+`MCP_RATE_LIMIT_REQUESTS` and `MCP_RATE_LIMIT_WINDOW_SECONDS`.
+
 ### Claude Code (`.mcp.json`)
 
 Without token:
