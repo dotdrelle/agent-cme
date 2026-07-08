@@ -22,6 +22,14 @@ COPY cme_source_urls.py .
 ENV CME_DATA_DIR=/data
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8080
+# confluence-markdown-exporter resolves its default app-config path via
+# click's get_app_dir(), which falls back to $HOME/.config. When the
+# container runs as an arbitrary non-root UID (no matching /etc/passwd
+# entry, see docker-compose `user:`), Path.home() resolves to "/" and the
+# mkdir fails with a permission error before the server can even start.
+# XDG_CONFIG_HOME is get_app_dir()'s first-choice override and keeps this
+# under the already-writable, already-mounted data directory.
+ENV XDG_CONFIG_HOME=/data/.config
 
 EXPOSE 8080
 
