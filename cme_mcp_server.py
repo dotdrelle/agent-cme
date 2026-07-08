@@ -51,6 +51,8 @@ from confluence_markdown_exporter.utils.app_data_store import (
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
 _AGENT_VERSION = "0.12.0"
+_AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
+_MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
 _CME_VENV_BIN = Path(__file__).parent / ".cme" / "bin" / "cme"
 _CME_BIN = str(_CME_VENV_BIN) if _CME_VENV_BIN.exists() else "cme"
@@ -69,7 +71,7 @@ _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
 _CURRENT_SCOPES: contextvars.ContextVar[set[str]] = contextvars.ContextVar("mcp_scopes", default={"read", "write"})
-_WRITE_TOOLS = {"cme_setup", "cme_source_add", "cme_source_remove", "cme_export_run", "cme_export_cancel"}
+_WRITE_TOOLS = {"agent_execute", "agent_cancel", "cme_setup", "cme_source_add", "cme_source_remove", "cme_export_run", "cme_export_cancel"}
 _RATE_LIMIT_REQUESTS = int(os.environ.get("MCP_RATE_LIMIT_REQUESTS", "120"))
 _RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MCP_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _RATE_BUCKETS: dict[str, list[float]] = {}
@@ -166,6 +168,10 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         else "Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients."
     )
     tool_names = [
+        ("agent_describe", "Describe the generic orchestration contract for agent-cme."),
+        ("agent_execute", "Execute one approved external source export task."),
+        ("agent_status", "Read one orchestrated CME export task status."),
+        ("agent_cancel", "Cancel one orchestrated CME export task."),
         ("cme_status", "Check agent-cme runtime configuration and readiness."),
         ("cme_setup", "Store agent-cme Confluence credentials and connection settings."),
         ("cme_sources_list", "List agent-cme configured Confluence export sources."),
@@ -259,6 +265,10 @@ def _now() -> str:
 
 def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"success", "failed", "error", "cancelled", "canceled", "done", "completed"}
+
+
+def _active_status(status: Any) -> bool:
+    return str(status or "").lower() in {"starting", "running", "queued", "cancelling"}
 
 
 def _validate_workspace(name: str) -> Path:
@@ -356,6 +366,274 @@ def _json_content(payload: dict[str, Any]) -> TextContent:
     return TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _json_payload(result: list[TextContent]) -> dict[str, Any]:
+    if not result:
+        return {}
+    text = str(result[0].text or "")
+    with contextlib.suppress(Exception):
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    return {"ok": False, "error": text}
+
+
+def _agent_description() -> dict[str, Any]:
+    limits: dict[str, int] = {"recommendedConcurrency": 1, "maxConcurrency": 1}
+    if _MAX_TASK_DURATION_MS > 0:
+        limits["maxTaskDurationMs"] = _MAX_TASK_DURATION_MS
+    return {
+        "contractVersion": "1",
+        "agentType": "cme",
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "displayName": "CME",
+        "capabilities": [{
+            "id": "external-source.export",
+            "version": "1",
+            "description": "Export configured Confluence sources to workspace raw/untracked markdown files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_name": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "outputSchema": {"type": "object", "additionalProperties": True},
+            "supportedOperations": ["export"],
+            "mutationClass": "external-source",
+            "defaultRequiresApproval": True,
+        }],
+        "orchestration": {
+            "canPlan": False,
+            "canExpandPlan": False,
+            "canExecute": True,
+            "canCancel": True,
+            "canResume": False,
+            "singleTaskOnly": True,
+            "supportsIdempotency": True,
+            "supportsParallelWorkers": False,
+        },
+        "limits": limits,
+        "health": {"status": "available" if _WORKSPACES_ROOT.exists() else "unavailable"},
+    }
+
+
+def _agent_execute_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "taskId": {"type": "string"},
+            "idempotencyKey": {"type": "string"},
+            "operation": {"type": "string", "enum": ["export"]},
+            "workspace": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "path": {"type": "string"},
+                    "revision": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "arguments": {
+                "type": "object",
+                "properties": {
+                    "source_name": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "constraints": {
+                "type": "object",
+                "properties": {
+                    "requireApprovalForMutations": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+        "required": ["operation", "workspace"],
+        "additionalProperties": True,
+    }
+
+
+def _agent_job_id_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {"jobId": {"type": "string"}},
+        "required": ["jobId"],
+        "additionalProperties": False,
+    }
+
+
+def _idempotency_path() -> Path:
+    return _DATA_DIR / "jobs" / "idempotency.json"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _normalize_idempotency_key(value: Any) -> str | None:
+    key = str(value or "").strip()
+    return key or None
+
+
+def _load_idempotency_store() -> dict[str, Any]:
+    path = _idempotency_path()
+    if not path.exists():
+        return {}
+    with contextlib.suppress(Exception):
+        payload = _read_json(path)
+        if isinstance(payload, dict):
+            return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+    return {}
+
+
+def _save_idempotency_store(payload: dict[str, Any]) -> None:
+    _write_json(_idempotency_path(), payload)
+
+
+def _record_idempotency(key: str, job_id: str, status: str) -> None:
+    store = _load_idempotency_store()
+    store[key] = {"jobId": job_id, "status": status}
+    _save_idempotency_store(store)
+
+
+def _update_idempotency_status_for_job(job_id: str, status: str) -> None:
+    store = _load_idempotency_store()
+    changed = False
+    for entry in store.values():
+        if isinstance(entry, dict) and str(entry.get("jobId") or "") == str(job_id):
+            entry["status"] = status
+            changed = True
+    if changed:
+        _save_idempotency_store(store)
+
+
+def _idempotent_job_for_key(key: str) -> tuple[str, dict[str, Any]] | None:
+    store = _load_idempotency_store()
+    entry = store.get(key)
+    if not isinstance(entry, dict):
+        return None
+    job_id = str(entry.get("jobId") or "").strip()
+    if not job_id:
+        return None
+    job = _jobs.get(job_id)
+    if not job:
+        store.pop(key, None)
+        _save_idempotency_store(store)
+        return None
+    status = str(job.get("status") or entry.get("status") or "unknown")
+    if entry.get("status") != status:
+        entry["status"] = status
+        _save_idempotency_store(store)
+    return job_id, job
+
+
+def _agent_result_status(status: Any) -> str:
+    value = str(status or "").lower()
+    if value in {"success", "done", "complete", "completed"}:
+        return "succeeded"
+    if value in {"cancelled", "canceled"}:
+        return "cancelled"
+    return "failed"
+
+
+def _agent_status_value(status: Any) -> str:
+    value = str(status or "").lower()
+    if value in {"success", "done", "complete", "completed"}:
+        return "done"
+    if value in {"cancelled", "canceled"}:
+        return "cancelled"
+    if value in {"failed", "error"}:
+        return "failed"
+    if value in {"starting", "running", "queued", "cancelling"}:
+        return "running"
+    return value or "unknown"
+
+
+def _agent_error_from_job(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    if status in {"cancelled", "canceled"}:
+        return {"code": "cancelled", "message": "Export cancelled.", "retryable": False}
+    message = str(job.get("error") or "CME export failed.")
+    return {
+        "code": "execution_failed",
+        "message": message,
+        "retryable": bool(re.search(r"(?i)\b(timeout|temporar|throttl|rate.?limit|quota|busy|unavailable)\b", message)),
+    }
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    with contextlib.suppress(ValueError, TypeError):
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return None
+
+
+def _duration_ms(job: dict[str, Any]) -> int:
+    started = _parse_iso_datetime(job.get("started_at"))
+    finished = _parse_iso_datetime(job.get("finished_at") or _now())
+    if not started or not finished:
+        return 0
+    return max(0, round((finished - started).total_seconds() * 1000))
+
+
+def _agent_output_refs_for_job(job: dict[str, Any]) -> list[dict[str, str]]:
+    output_path = str(job.get("output_path") or "")
+    if not output_path:
+        return []
+    workspace_path = Path(str(job.get("workspace_path") or ""))
+    path = Path(output_path)
+    if workspace_path and path.is_absolute():
+        with contextlib.suppress(ValueError):
+            return [{"type": "directory", "ref": path.relative_to(workspace_path).as_posix()}]
+    return [{"type": "directory", "ref": "raw/untracked"}]
+
+
+def _agent_task_result(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    result = {
+        "status": _agent_result_status(status),
+        "outputRefs": _agent_output_refs_for_job(job),
+        "metrics": {"durationMs": _duration_ms(job)},
+    }
+    if status in {"failed", "error", "cancelled", "canceled"}:
+        result["error"] = _agent_error_from_job(job)
+    return result
+
+
+def _agent_task_status(job_id: str, job: dict[str, Any], task_id: Any = None) -> dict[str, Any]:
+    status = str(job.get("status") or "unknown")
+    stdout = job.get("stdout") or []
+    stderr = job.get("stderr") or []
+    payload = {
+        "jobId": job_id,
+        "taskId": task_id,
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "workspace": {"name": str(job.get("workspace") or "")},
+        "operation": "export",
+        "status": _agent_status_value(status),
+        "progress": {
+            "percent": 100 if _agent_status_value(status) == "done" else 0,
+            "phase": "export",
+            "detail": f"stdout={len(stdout)} stderr={len(stderr)}",
+        },
+        "startedAt": job.get("started_at"),
+        "updatedAt": job.get("finished_at") or _now(),
+        "finishedAt": job.get("finished_at"),
+    }
+    if _terminal_status(status):
+        payload["result"] = _agent_task_result(job)
+        _update_idempotency_status_for_job(job_id, status)
+    return payload
+
+
 def _load_manifest(workspace: str) -> dict:
     manifest_path = _workspace_manifest(workspace)
     _init_manifest_if_missing(workspace)
@@ -409,6 +687,26 @@ def _lock_summary(output_path: Path | None = None) -> dict:
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        Tool(
+            name="agent_describe",
+            description="Describe the generic orchestration contract exposed by agent-cme.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        Tool(
+            name="agent_execute",
+            description="Execute one approved external-source.export task through the generic orchestration contract.",
+            inputSchema=_agent_execute_input_schema(),
+        ),
+        Tool(
+            name="agent_status",
+            description="Read one generic CME task status.",
+            inputSchema=_agent_job_id_input_schema(),
+        ),
+        Tool(
+            name="agent_cancel",
+            description="Cancel one generic CME task by jobId.",
+            inputSchema=_agent_job_id_input_schema(),
+        ),
         Tool(
             name="cme_status",
             description=(
@@ -575,6 +873,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if denied is not None:
             return denied
         match name:
+            case "agent_describe":
+                result = _tool_agent_describe()
+            case "agent_execute":
+                result = await _tool_agent_execute(arguments)
+            case "agent_status":
+                result = _tool_agent_status(arguments)
+            case "agent_cancel":
+                result = await _tool_agent_cancel(arguments)
             case "cme_status":
                 result = await _tool_status(arguments)
             case "cme_setup":
@@ -601,6 +907,110 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elapsed_ms = round((time.perf_counter() - start) * 1000)
         print(f"[cme-mcp] tools/result {name} exception {elapsed_ms}ms {_mask_secret_text(exc)}")
         raise
+
+
+def _tool_agent_describe() -> list[TextContent]:
+    return [_json_content(_agent_description())]
+
+
+async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
+    operation = str(args.get("operation") or "").strip()
+    if operation != "export":
+        return [_json_content({
+            "accepted": False,
+            "agentInstanceId": _AGENT_INSTANCE_ID,
+            "taskId": args.get("taskId"),
+            "error": f"Unsupported CME operation: {operation}",
+        })]
+    workspace = args.get("workspace")
+    if not isinstance(workspace, dict):
+        return [_json_content({
+            "accepted": False,
+            "agentInstanceId": _AGENT_INSTANCE_ID,
+            "taskId": args.get("taskId"),
+            "error": "agent_execute requires a workspace object.",
+        })]
+    workspace_name = _workspace_name(str(workspace.get("name") or "").strip())
+    idempotency_key = _normalize_idempotency_key(args.get("idempotencyKey"))
+    if idempotency_key:
+        existing = _idempotent_job_for_key(idempotency_key)
+        if existing:
+            job_id, job = existing
+            status_payload = _agent_task_status(job_id, job, task_id=args.get("taskId") or job.get("task_id"))
+            response = {
+                "accepted": True,
+                "idempotent": True,
+                "agentInstanceId": _AGENT_INSTANCE_ID,
+                "taskId": args.get("taskId") or job.get("task_id"),
+                "jobId": job_id,
+                "status": status_payload["status"],
+            }
+            if _terminal_status(job.get("status")):
+                response["terminal"] = True
+                response["result"] = status_payload.get("result")
+            elif _active_status(job.get("status")):
+                response["terminal"] = False
+            return [_json_content(response)]
+
+    arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    export_args = {"workspace": workspace_name}
+    if arguments.get("source_name"):
+        export_args["source_name"] = str(arguments["source_name"])
+    result = _json_payload(await _tool_export_run(export_args))
+    if not result.get("ok"):
+        return [_json_content({
+            "accepted": False,
+            "agentInstanceId": _AGENT_INSTANCE_ID,
+            "taskId": args.get("taskId"),
+            "error": result.get("error") or result.get("message") or "execution_rejected",
+        })]
+    job_id = str(result.get("job_id") or result.get("jobId") or "")
+    if job_id and job_id in _jobs:
+        _jobs[job_id]["task_id"] = args.get("taskId")
+        _jobs[job_id]["operation"] = operation
+    if idempotency_key and job_id:
+        _record_idempotency(idempotency_key, job_id, str(result.get("status") or "starting"))
+    return [_json_content({
+        "accepted": True,
+        **({"idempotent": False} if idempotency_key else {}),
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "taskId": args.get("taskId"),
+        "jobId": job_id,
+        "status": result.get("status", "starting"),
+    })]
+
+
+def _tool_agent_status(args: dict[str, Any]) -> list[TextContent]:
+    job_id = str(args.get("jobId") or "").strip()
+    job = _jobs.get(job_id)
+    if not job:
+        return [_json_content({
+            "jobId": job_id,
+            "agentInstanceId": _AGENT_INSTANCE_ID,
+            "operation": "export",
+            "status": "failed",
+            "result": {
+                "status": "failed",
+                "outputRefs": [],
+                "metrics": {"durationMs": 0},
+                "error": {"code": "unknown_job", "message": f"Unknown jobId: {job_id}", "retryable": False},
+            },
+        })]
+    return [_json_content(_agent_task_status(job_id, job, task_id=job.get("task_id")))]
+
+
+async def _tool_agent_cancel(args: dict[str, Any]) -> list[TextContent]:
+    job_id = str(args.get("jobId") or "").strip()
+    result = await _tool_export_cancel({"job_id": job_id})
+    job = _jobs.get(job_id)
+    if job:
+        return [_json_content(_agent_task_status(job_id, job, task_id=job.get("task_id")))]
+    payload = _json_payload(result)
+    return [_json_content({
+        "ok": False,
+        "jobId": job_id,
+        "error": payload.get("error") or payload.get("message") or str(result[0].text if result else "cancel_failed"),
+    })]
 
 
 async def _tool_status(args: dict) -> list[TextContent]:

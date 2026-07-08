@@ -161,14 +161,105 @@ class CmeMcpServerTest(unittest.TestCase):
     def test_read_scope_cannot_call_mutating_tool(self):
         token = self.server._CURRENT_SCOPES.set({"read"})
         try:
+            denied_agent = self.server._require_tool_scope("agent_execute")
             denied = self.server._require_tool_scope("cme_export_run")
             allowed = self.server._require_tool_scope("cme_status")
         finally:
             self.server._CURRENT_SCOPES.reset(token)
 
+        self.assertIsNotNone(denied_agent)
         self.assertIsNotNone(denied)
         self.assertIn("write scope", denied[0].text)
         self.assertIsNone(allowed)
+
+    def test_agent_describe_exposes_generic_cme_contract(self):
+        description = json.loads(self.server._tool_agent_describe()[0].text)
+
+        self.assertEqual(description["contractVersion"], "1")
+        self.assertEqual(description["agentType"], "cme")
+        self.assertEqual(description["agentInstanceId"], "cme-main")
+        self.assertEqual(description["orchestration"]["canPlan"], False)
+        self.assertEqual(description["orchestration"]["canExecute"], True)
+        self.assertEqual(description["orchestration"]["singleTaskOnly"], True)
+        self.assertEqual(description["orchestration"]["supportsIdempotency"], True)
+        self.assertEqual(description["capabilities"][0]["id"], "external-source.export")
+        self.assertEqual(description["capabilities"][0]["version"], "1")
+        self.assertEqual(description["capabilities"][0]["supportedOperations"], ["export"])
+        self.assertEqual(description["capabilities"][0]["defaultRequiresApproval"], True)
+        self.assertNotIn("operation", description["capabilities"][0]["inputSchema"].get("required", []))
+
+    def test_agent_execute_is_idempotent_for_same_key(self):
+        calls = 0
+
+        async def fake_export_run(args):
+            nonlocal calls
+            calls += 1
+            job_id = f"job-{calls}"
+            now = self.server._now()
+            workspace_path = self.workspaces / args["workspace"]
+            output_path = workspace_path / "raw" / "untracked"
+            self.server._jobs[job_id] = {
+                "status": "success",
+                "workspace": args["workspace"],
+                "workspace_path": str(workspace_path),
+                "output_path": str(output_path),
+                "sources": [args.get("source_name") or "all"],
+                "started_at": now,
+                "finished_at": now,
+                "stdout": [],
+                "stderr": [],
+            }
+            return [self.server._json_content({"ok": True, "job_id": job_id, "status": "success"})]
+
+        self.server._tool_export_run = fake_export_run
+        request = {
+            "taskId": "task-cme",
+            "idempotencyKey": "idem-cme",
+            "operation": "export",
+            "workspace": {"name": "demo", "revision": "rev-1"},
+            "arguments": {"source_name": "docs"},
+        }
+
+        first = json.loads(asyncio.run(self.server._tool_agent_execute(request))[0].text)
+        second = json.loads(asyncio.run(self.server._tool_agent_execute(request))[0].text)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(first["accepted"], True)
+        self.assertEqual(first["idempotent"], False)
+        self.assertEqual(second["accepted"], True)
+        self.assertEqual(second["idempotent"], True)
+        self.assertEqual(second["jobId"], first["jobId"])
+        self.assertEqual(second["terminal"], True)
+        self.assertEqual(second["result"]["status"], "succeeded")
+
+    def test_agent_status_and_cancel_wrap_export_job(self):
+        now = self.server._now()
+        job_id = "job-running"
+        self.server._jobs[job_id] = {
+            "status": "running",
+            "workspace": "demo",
+            "workspace_path": str(self.workspaces / "demo"),
+            "output_path": str(self.workspaces / "demo" / "raw" / "untracked"),
+            "sources": ["docs"],
+            "started_at": now,
+            "stdout": ["line"],
+            "stderr": [],
+            "task_id": "task-cme",
+        }
+
+        async def fake_cancel(args):
+            self.server._jobs[args["job_id"]]["status"] = "cancelled"
+            self.server._jobs[args["job_id"]]["finished_at"] = self.server._now()
+            return [self.server.TextContent(type="text", text="cancelled")]
+
+        self.server._tool_export_cancel = fake_cancel
+        status = json.loads(self.server._tool_agent_status({"jobId": job_id})[0].text)
+        cancelled = json.loads(asyncio.run(self.server._tool_agent_cancel({"jobId": job_id}))[0].text)
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["taskId"], "task-cme")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["result"]["status"], "cancelled")
 
 
 if __name__ == "__main__":
