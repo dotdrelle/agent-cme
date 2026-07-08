@@ -7,6 +7,16 @@ server. It lets an orchestrating agent configure Confluence export sources per
 workspace, start asynchronous exports, monitor jobs, and write Markdown files
 into a local export directory.
 
+Since 0.12.0 it is also an **executor-only orchestrable agent** for the
+manager's agnostic orchestration: it implements `agent_describe`
+(`canPlan: false`, `singleTaskOnly: true`), `agent_execute`, `agent_status`
+and `agent_cancel`, declaring the capability `external-source.export` with
+`defaultRequiresApproval: true`. Configuring credentials or sources
+(`cme_setup`, `cme_source_add`) must **never** trigger an export — exports run
+only as approved orchestrated tasks (or explicit direct `cme_export_run`
+calls). `agent_execute` is idempotent: key→job mappings are persisted so a
+retry with a known `idempotencyKey` returns the existing job or result.
+
 ## Architecture
 
 - `cme_mcp_server.py`: Starlette/uvicorn MCP server, bearer-auth middleware,
@@ -52,7 +62,7 @@ into a local export directory.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.11.1`. Alignment is checked by
+  Current release line: `0.12.0`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
@@ -81,9 +91,9 @@ Auth token is read from `CME_MCP_AUTH_TOKEN` in the manager's `.env`.
 **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy
 full-access (read+write) token; `MCP_READ_TOKEN`/`MCP_WRITE_TOKEN` grant
 scoped access instead. `_token_scopes` compares with `hmac.compare_digest`
-(constant-time). `_require_tool_scope` denies `_WRITE_TOOLS` (`cme_setup`,
-`cme_source_add`, `cme_source_remove`, `cme_export_run`, `cme_export_cancel`)
-to read-only callers; the current request's scope is threaded through a
+(constant-time). `_require_tool_scope` denies `_WRITE_TOOLS` (`agent_execute`, `agent_cancel`,
+`cme_setup`, `cme_source_add`, `cme_source_remove`, `cme_export_run`,
+`cme_export_cancel`) to read-only callers; the current request's scope is threaded through a
 `contextvars.ContextVar` set by `_BearerAuthMiddleware`, not passed
 explicitly. Requests are rate-limited (`MCP_RATE_LIMIT_REQUESTS`/
 `MCP_RATE_LIMIT_WINDOW_SECONDS`, default 120/60s) keyed by token or remote IP.
@@ -98,12 +108,12 @@ extracting one is a real packaging/versioning decision, not a quick fix. If
 that decision is made, keep the fix in whichever of these files is edited
 first in sync with the other three by hand until a shared module exists.
 
-**Multi-user status** (0.11.0): this agent's bearer-token scoping is
+**Multi-user status**: this agent's bearer-token scoping is
 per-token, not per-user — it distinguishes read vs. write access, not one
-caller's workspace/data from another's. 0.11.0 is an industrialized
-single-user deployment baseline across the whole wikiLLM workspace; the
-multi-user model (identity, ownership, per-user scopes/conflicts) is
-specified in `llm-wiki/docs/industrialisation.md` and planned for 0.12.0.
+caller's workspace/data from another's. The wikiLLM workspace remains an
+industrialized single-user deployment baseline; the multi-user model
+(identity, ownership, per-user scopes/conflicts) is specified in
+`llm-wiki/docs/industrialisation.md` and planned next.
 Until that lands, do not deploy this agent as a shared endpoint serving
 distinct end users who should not see each other's export sources or data —
 treat it as a workspace-scoped service protected by bearer tokens, the same

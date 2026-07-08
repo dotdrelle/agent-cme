@@ -168,6 +168,19 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
 | `cme_export_status` | Check job progress, or show last-export summary. With `job_id`, returns `_activity`.      |
 
+Orchestration contract (used by `llm-wiki-manager`'s generic orchestrator —
+executor-only agent, `canPlan: false`):
+
+| Tool             | Description                                                                                  |
+| ---------------- | -------------------------------------------------------------------------------------------- |
+| `agent_describe` | Declare the `external-source.export` capability (`defaultRequiresApproval: true`), limits, health. |
+| `agent_execute`  | Execute one approved export task; idempotent via `idempotencyKey` (a retry returns the existing job). |
+| `agent_status`   | Report orchestrated task progress and final result.                                          |
+| `agent_cancel`   | Cancel the job bound to one orchestrated task.                                               |
+
+Configuring credentials or sources never triggers an export: exports run only
+as approved orchestrated tasks or explicit `cme_export_run` calls.
+
 ### Activity metadata
 
 `cme_export_run` and `cme_export_status(job_id=...)` include additive
