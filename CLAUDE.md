@@ -1,5 +1,8 @@
 # Repository Guide
 
+Current coordinated release: **0.14.5**. Keep `_AGENT_VERSION` aligned with
+the coordinated workspace stack.
+
 ## Goal
 
 `agent-cme` exposes `confluence-markdown-exporter` as an MCP Streamable HTTP
