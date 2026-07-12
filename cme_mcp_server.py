@@ -50,7 +50,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.14.1"
+_AGENT_VERSION = "0.14.2"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -689,22 +689,29 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="agent_describe",
-            description="Describe the generic orchestration contract exposed by agent-cme.",
+            description=(
+                "Return agent-cme's generic multi-agent orchestration contract: its external-source.export capability "
+                "and input schema. It tells an orchestrator what this agent can do. A caller that just wants to run an "
+                "export directly does not need this — use the cme_* tools (cme_export_run, cme_export_status, cme_status, …) instead."
+            ),
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
             name="agent_execute",
-            description="Execute one approved external-source.export task through the generic orchestration contract.",
+            description=(
+                "Orchestration-contract execution. Run ONE approved external-source.export task and return a jobId; poll "
+                "agent_status. Intended for an orchestrator; a direct caller should use cme_export_run instead."
+            ),
             inputSchema=_agent_execute_input_schema(),
         ),
         Tool(
             name="agent_status",
-            description="Read one generic CME task status.",
+            description="Orchestration-contract status. Read one CME export task by its jobId (same underlying job as cme_export_status).",
             inputSchema=_agent_job_id_input_schema(),
         ),
         Tool(
             name="agent_cancel",
-            description="Cancel one generic CME task by jobId.",
+            description="Orchestration-contract cancel. Cancel one CME export task by its jobId.",
             inputSchema=_agent_job_id_input_schema(),
         ),
         Tool(
@@ -812,7 +819,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Start an asynchronous agent-cme Confluence-to-Markdown export for one or all configured sources. "
                 "Use this when the user asks agent-cme to run or refresh an export. "
-                "This only exports Confluence content to Markdown files on disk; it does not ingest content into llm-wiki. "
+                "This is a SOURCE export: it pulls Confluence content into Markdown files under <workspace>/raw/untracked. "
+                "It is NOT an llm-wiki deliverable/publication export (that is the production agent's export), and it does not ingest content into llm-wiki. "
                 "To ingest exported files into the wiki, run production_start_job(type=\"ingest\") separately. "
                 "Use cme_export_cancel(job_id=...) to request cancellation of a running export; files already written before cancellation are left in place. "
                 "If the export fails during the initial Confluence preflight request, such as /rest/api/space?limit=1, no markdown export files have been written yet. "
