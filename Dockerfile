@@ -6,11 +6,10 @@ WORKDIR /app
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
     confluence-markdown-exporter==5.2.1 \
-    "mcp>=1.9.4" \
+    "mcp>=1.9.4,<2" \
     starlette \
     uvicorn \
     pyyaml
-
 # Patch CME library: expand space_key regex to support personal spaces (~user@domain.com).
 # Upstream [A-Za-z0-9_~-]+ / [A-Za-z0-9._-]+ stop at '.' or '@' in email-style keys.
 COPY patch_cme_urls.py .
