@@ -50,7 +50,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.15.29"
+_AGENT_VERSION = "0.15.32"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -377,7 +377,52 @@ def _json_payload(result: list[TextContent]) -> dict[str, Any]:
     return {"ok": False, "error": text}
 
 
-def _agent_description() -> dict[str, Any]:
+# The orchestrator plans against this schema alone, and a planner LLM fills any
+# bare `{"type": "string"}` with whatever string the objective contains — for an
+# objective like "export the Confluence pages of workspace acpi" that is the
+# WORKSPACE name, which is never a source name. The meaning of the field has to
+# live here, in the agent's own contract: the manager is business-agnostic and
+# must not carry per-agent knowledge.
+_SOURCE_NAME_DESCRIPTION = (
+    "Name of a single export source, exactly as declared in this workspace's "
+    "sources manifest (list them with cme_sources_list). "
+    "OMIT THIS FIELD to export every configured source — that is the normal case "
+    "and the right choice whenever the request does not name one specific source. "
+    "This is NOT a workspace name, a Confluence space key, a page title or a URL: "
+    "passing anything that is not an already-declared source name fails the task."
+)
+
+
+def _declared_source_names(workspace: str) -> list[str]:
+    """Source names declared for a workspace, or [] when they cannot be read.
+
+    Never raises: agent_describe is a discovery call, and an unreadable or
+    absent manifest must degrade to "no enum published", not to an unavailable
+    agent.
+    """
+    if not workspace:
+        return []
+    try:
+        exports = _load_manifest(workspace).get("exports") or []
+    except Exception:
+        return []
+    return [str(e["name"]) for e in exports if isinstance(e, dict) and e.get("name")]
+
+
+def _agent_description(workspace: str = "") -> dict[str, Any]:
+    # source_name is a reference to an already-declared entity, not free text.
+    # Published as a bare string it is unverifiable, and a planner LLM fills it
+    # with whichever noun the objective contains ("acpi", "Confluence"). The
+    # closed vocabulary is known here and nowhere else, so publish it: an enum
+    # is the only form the orchestrator can check without guessing at meaning.
+    source_names = _declared_source_names(workspace)
+    source_name_schema: dict[str, Any] = {
+        "type": "string",
+        "description": _SOURCE_NAME_DESCRIPTION,
+    }
+    if source_names:
+        source_name_schema["enum"] = source_names
+
     limits: dict[str, int] = {"recommendedConcurrency": 1, "maxConcurrency": 1}
     if _MAX_TASK_DURATION_MS > 0:
         limits["maxTaskDurationMs"] = _MAX_TASK_DURATION_MS
@@ -389,11 +434,15 @@ def _agent_description() -> dict[str, Any]:
         "capabilities": [{
             "id": "external-source.export",
             "version": "1",
-            "description": "Export configured Confluence sources to workspace raw/untracked markdown files.",
+            "description": (
+                "Export configured Confluence sources to workspace raw/untracked markdown files. "
+                "Sources are configured out of band (cme_source_add); this capability only exports "
+                "what is already declared, and takes no argument in the common case."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "source_name": {"type": "string"},
+                    "source_name": source_name_schema,
                 },
                 "additionalProperties": True,
             },
@@ -436,7 +485,10 @@ def _agent_execute_input_schema() -> dict[str, Any]:
             "arguments": {
                 "type": "object",
                 "properties": {
-                    "source_name": {"type": "string"},
+                    "source_name": {
+                        "type": "string",
+                        "description": _SOURCE_NAME_DESCRIPTION,
+                    },
                 },
                 "additionalProperties": True,
             },
@@ -694,7 +746,24 @@ async def list_tools() -> list[Tool]:
                 "and input schema. It tells an orchestrator what this agent can do. A caller that just wants to run an "
                 "export directly does not need this — use the cme_* tools (cme_export_run, cme_export_status, cme_status, …) instead."
             ),
-            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+            # `workspace` must be declared, not merely tolerated: an orchestrator
+            # reads this schema to decide whether it may send the argument, and
+            # a strict schema without it means the contract is fetched
+            # workspace-blind — source_name then ships without its enum.
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": (
+                            "Workspace whose contract is requested. Scopes the source_name "
+                            "vocabulary to the sources declared in that workspace. Optional: "
+                            "omitted, the description is workspace-independent."
+                        ),
+                    },
+                },
+                "additionalProperties": False,
+            },
         ),
         Tool(
             name="agent_execute",
@@ -882,7 +951,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return denied
         match name:
             case "agent_describe":
-                result = _tool_agent_describe()
+                result = _tool_agent_describe(arguments)
             case "agent_execute":
                 result = await _tool_agent_execute(arguments)
             case "agent_status":
@@ -917,8 +986,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise
 
 
-def _tool_agent_describe() -> list[TextContent]:
-    return [_json_content(_agent_description())]
+def _tool_agent_describe(args: dict[str, Any] | None = None) -> list[TextContent]:
+    # The orchestrator passes the active workspace so the description can carry
+    # workspace-scoped vocabulary. Absent (older manager, generic probe), the
+    # description stays workspace-independent and simply publishes no enum.
+    workspace = str((args or {}).get("workspace") or "").strip()
+    return [_json_content(_agent_description(workspace))]
 
 
 async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
@@ -1201,7 +1274,19 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     if source_name:
         sources = [e for e in exports if e.get("name") == source_name]
         if not sources:
-            return [TextContent(type="text", text=f"Error: source '{source_name}' not found")]
+            # Name what exists: a bare "not found" tells neither the user nor
+            # the planner whether the source is missing or merely misnamed, and
+            # an orchestrator handed that string can only guess.
+            available = [str(e.get("name")) for e in exports if e.get("name")]
+            detail = (
+                f"declared sources in workspace '{workspace}': {', '.join(available)}"
+                if available
+                else f"workspace '{workspace}' has no declared source"
+            )
+            return [TextContent(type="text", text=(
+                f"Error: source '{source_name}' not found — {detail}. "
+                "Omit source_name to export all declared sources."
+            ))]
     else:
         sources = exports
     if not sources:

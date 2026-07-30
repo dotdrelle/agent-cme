@@ -188,6 +188,72 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertEqual(description["capabilities"][0]["defaultRequiresApproval"], True)
         self.assertNotIn("operation", description["capabilities"][0]["inputSchema"].get("required", []))
 
+    def test_capability_schema_tells_the_planner_what_source_name_means(self):
+        # A bare {"type": "string"} is what led a planner to pass the WORKSPACE
+        # name as a source name. The contract must say the field is optional,
+        # must match a declared source, and is not a workspace name.
+        description = json.loads(self.server._tool_agent_describe()[0].text)
+        schema = description["capabilities"][0]["inputSchema"]
+
+        self.assertNotIn("source_name", schema.get("required", []))
+        text = schema["properties"]["source_name"]["description"].lower()
+        self.assertIn("omit", text)
+        self.assertIn("not a workspace name", text)
+
+    def test_describe_publishes_the_declared_sources_as_a_closed_vocabulary(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "http://confluence.example",
+            "username": "user@example.com",
+            "pat": "token",
+        }))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "EAS_Avant_projet_ACPI",
+            "type": "page-with-descendants",
+            "url": "http://confluence.example/spaces/ODG/pages/1/EAS",
+        }))
+
+        described = json.loads(self.server._tool_agent_describe({"workspace": "demo"})[0].text)
+        schema = described["capabilities"][0]["inputSchema"]["properties"]["source_name"]
+
+        # Without the enum, a planner fills this field with any noun from the
+        # objective ("acpi", "Confluence") and the task fails.
+        self.assertEqual(schema["enum"], ["EAS_Avant_projet_ACPI"])
+
+    def test_describe_without_a_workspace_publishes_no_vocabulary(self):
+        described = json.loads(self.server._tool_agent_describe()[0].text)
+        schema = described["capabilities"][0]["inputSchema"]["properties"]["source_name"]
+
+        # Generic probe or older manager: degrade to a plain string, never fail.
+        self.assertNotIn("enum", schema)
+        self.assertIn("description", schema)
+
+    def test_export_run_rejects_an_unknown_source_by_naming_the_declared_ones(self):
+        args = {
+            "workspace": "demo",
+            "base_url": "http://confluence.example",
+            "username": "user@example.com",
+            "pat": "token",
+        }
+        asyncio.run(self.server._tool_setup(args))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "EAS_Avant_projet_ACPI",
+            "type": "page-with-descendants",
+            "url": "http://confluence.example/spaces/ODG/pages/1/EAS",
+        }))
+
+        result = asyncio.run(self.server._tool_export_run({
+            "workspace": "demo",
+            "source_name": "demo",
+        }))[0].text
+
+        self.assertIn("not found", result)
+        # The reader must be able to act on this without a second round-trip.
+        self.assertIn("EAS_Avant_projet_ACPI", result)
+        self.assertIn("Omit source_name", result)
+
     def test_agent_execute_is_idempotent_for_same_key(self):
         calls = 0
 
