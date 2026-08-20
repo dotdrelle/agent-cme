@@ -439,6 +439,8 @@ def _agent_description(workspace: str = "") -> dict[str, Any]:
                 "Sources are configured out of band (cme_source_add); this capability only exports "
                 "what is already declared, and takes no argument in the common case."
             ),
+            # Disambiguates "export" from the production agent's document.publish.
+            "aliases": ["confluence", "confluence export", "source export", "export sources"],
             "inputSchema": {
                 "type": "object",
                 "properties": {
