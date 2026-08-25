@@ -50,7 +50,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.15.59"
+_AGENT_VERSION = "0.15.60"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -173,6 +173,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         ("agent_status", "Read one orchestrated CME export task status."),
         ("agent_cancel", "Cancel one orchestrated CME export task."),
         ("cme_status", "Check agent-cme runtime configuration and readiness."),
+        ("cme_test_connection", "Test the live Confluence connection for a workspace."),
         ("cme_setup", "Store agent-cme Confluence credentials and connection settings."),
         ("cme_sources_list", "List agent-cme configured Confluence export sources."),
         ("cme_source_add", "Add or update a Confluence export source."),
@@ -803,6 +804,24 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="cme_test_connection",
+            description=(
+                "Test the live Confluence connection for one workspace: performs a real "
+                "authenticated request against the configured base URL and reports whether "
+                "credentials, SSL mode and reachability work. Use this after cme_setup, or "
+                "when an export fails at the preflight stage, to distinguish bad credentials "
+                "from an unreachable or SSL-mismatched server. Unlike cme_status (which only "
+                "reports whether credentials are stored), this actually reaches Confluence."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Credentials are read from the agent state for this workspace."},
+                },
+                "required": ["workspace"],
+            },
+        ),
+        Tool(
             name="cme_setup",
             description=(
                 "One-time agent-cme initialization: stores Confluence credentials and connection settings persistently. "
@@ -962,6 +981,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result = await _tool_agent_cancel(arguments)
             case "cme_status":
                 result = await _tool_status(arguments)
+            case "cme_test_connection":
+                result = await _tool_test_connection(arguments)
             case "cme_setup":
                 result = await _tool_setup(arguments)
             case "cme_sources_list":
@@ -1132,6 +1153,81 @@ async def _tool_status(args: dict) -> list[TextContent]:
     else:
         lines.append("action_required: call cme_setup to initialize")
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _tool_test_connection(args: dict) -> list[TextContent]:
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    with _cme_workspace_context(workspace):
+        settings = get_settings()
+    data = json.loads(settings.model_dump_json())
+    confluence = data.get("auth", {}).get("confluence", {})
+    instances = {
+        url: creds
+        for url, creds in confluence.items()
+        if creds.get("pat") or creds.get("api_token")
+    }
+    if not instances:
+        return [TextContent(type="text", text=(
+            "not_configured: no Confluence instance for this workspace. Call cme_setup first."
+        ))]
+    conn = data.get("connection_config", {})
+    verify_ssl = bool(conn.get("verify_ssl", True))
+    use_v2_api = bool(conn.get("use_v2_api", False))
+    lines = ["workspace: " + workspace]
+    for url, creds in instances.items():
+        result = await asyncio.to_thread(
+            _probe_confluence, str(url), creds, verify_ssl, use_v2_api
+        )
+        lines.append(f"  {url}  {result}")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+def _probe_confluence(
+    base_url: str,
+    creds: dict[str, Any],
+    verify_ssl: bool,
+    use_v2_api: bool,
+) -> str:
+    """One real, bounded, authenticated request against a Confluence instance.
+
+    Kept synchronous on purpose: `_tool_test_connection` wraps it in a thread so
+    the event loop is not blocked by network I/O. Returns a single human-readable
+    verdict (ok / auth failed / reachable but HTTP nnn / unreachable …), never
+    the credentials themselves.
+    """
+    import base64
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    base = base_url.rstrip("/")
+    endpoint = "/rest/api/space?limit=1" if not use_v2_api else "/rest/api/v2/spaces?limit=1"
+    url = base + endpoint
+    headers = {"Accept": "application/json"}
+    if creds.get("pat"):
+        headers["Authorization"] = f"Bearer {creds['pat']}"
+    elif creds.get("api_token"):
+        pair = f"{creds.get('username', '')}:{creds['api_token']}".encode()
+        headers["Authorization"] = "Basic " + base64.b64encode(pair).decode()
+    else:  # pragma: no cover - guarded by the caller's filter
+        return "incomplete credentials (no pat or api_token)"
+
+    context: ssl.SSLContext | None = None
+    if not verify_ssl:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10, context=context) as response:
+            return f"ok (HTTP {response.status})"
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            return f"auth failed (HTTP {error.code}) — check credentials"
+        return f"reachable but HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001 - diagnostic, all failures reported
+        return f"unreachable ({type(error).__name__}: {error})"
 
 
 async def _tool_setup(args: dict) -> list[TextContent]:

@@ -6,8 +6,10 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 
 STORE = {}
@@ -147,6 +149,35 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertIn("status: configured", status)
         self.assertIn("auth=pat", status)
         self.assertNotIn("secret-pat", status)
+
+    def test_test_connection_reports_not_configured_when_no_instance(self):
+        text = asyncio.run(self.server._tool_test_connection({"workspace": "demo"}))[0].text
+        self.assertIn("not_configured", text)
+
+    def test_test_connection_reports_ok_and_redacts_secret(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.status = 200
+            text = asyncio.run(self.server._tool_test_connection({"workspace": "demo"}))[0].text
+        self.assertIn("ok (HTTP 200)", text)
+        self.assertNotIn("secret-pat", text)
+
+    def test_test_connection_reports_auth_failure(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        error = urllib.error.HTTPError("https://confluence.example/rest/api/space?limit=1", 401, "Unauthorized", {}, None)
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            text = asyncio.run(self.server._tool_test_connection({"workspace": "demo"}))[0].text
+        self.assertIn("auth failed", text)
 
     def test_mask_helpers_redact_structured_and_text_secrets(self):
         masked = self.server._mask_secrets({"pat": "secret", "nested": {"password": "pw"}})
