@@ -4,7 +4,7 @@
 
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME per workspace, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
-Current coordinated release: **0.14.5**.
+Current coordinated release: **0.15.66**.
 
 `agent-cme` is the exporter only. One global instance serves all workspaces:
 credentials, source manifests, and exports are isolated per workspace. When

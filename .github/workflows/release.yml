@@ -22,16 +22,16 @@ jobs:
           path: llm-wiki
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/agent-wiki-production
-          path: agent-wiki-production
+          repository: ${{ github.repository_owner }}/agent-production
+          path: agent-external/agent-production
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/agent-mailer-api
           path: agent-external/agent-mailer-api
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/agent-wiki-documents
-          path: agent-external/agent-wiki-documents
+          repository: ${{ github.repository_owner }}/agent-documents
+          path: agent-external/agent-documents
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -1,6 +1,6 @@
 # Repository Guide
 
-Current coordinated release: **0.14.5**. Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.15.66**. Keep `_AGENT_VERSION` aligned with
 the coordinated workspace stack.
 
 ## Goal
@@ -65,7 +65,7 @@ retry with a known `idempotencyKey` returns the existing job or result.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.12.0`. Alignment is checked by
+  Current release line: `0.15.66`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
@@ -103,8 +103,8 @@ explicitly. Requests are rate-limited (`MCP_RATE_LIMIT_REQUESTS`/
 `_any_token_configured()` is the single "is any token set" check, used both
 at startup (unauthenticated-access warning) and inside `_token_scopes`; this
 same auth/scope/rate-limit block is copy-pasted near-verbatim into the other
-three agent repos (`agent-mailer-api`, `agent-wiki-documents`,
-`agent-wiki-production`) and again, separately, in `llm-wiki`'s TypeScript
+three agent repos (`agent-mailer-api`, `agent-documents`,
+`agent-production`) and again, separately, in `llm-wiki`'s TypeScript
 `mcpHttp.ts` — deliberate, not an oversight: these are four independently
 deployed Docker images with no shared Python package between them today, so
 extracting one is a real packaging/versioning decision, not a quick fix. If
