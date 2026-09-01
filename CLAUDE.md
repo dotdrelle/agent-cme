@@ -25,6 +25,12 @@ retry with a known `idempotencyKey` returns the existing job or result.
 - `cme_mcp_server.py`: Starlette/uvicorn MCP server, bearer-auth middleware,
   HTML status page, tool definitions, source manifest handling, and async CME
   job execution.
+- `confluence_search.py`: live read-only Confluence search — one bounded CQL
+  request with the workspace's stored credentials. Separate component of the
+  same agent, never triggers an export.
+- `wiki_search.py`: live read-only search over `workspaces/<ws>/wiki/` on
+  disk (token match, first-`#` titles, excerpts). Separate component of the
+  same agent; builds no index, writes nothing.
 - `cme_source_urls.py`: URL normalisation helpers (`extract_confluence_url`,
   `parse_confluence_source_url`). Accepts raw URLs, Markdown links, `/spaces/`,
   `/display/`, and `pageId=` forms and returns manifest-ready source fields.

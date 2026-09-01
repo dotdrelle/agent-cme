@@ -40,6 +40,8 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from cme_source_urls import extract_confluence_url, parse_confluence_source_url
+from confluence_search import ConfluenceSearchError, search_confluence, search_error_message
+from wiki_search import WikiSearchError, search_wiki, wiki_search_error_message
 from confluence_markdown_exporter.utils import app_data_store
 from confluence_markdown_exporter.utils.app_data_store import (
     get_settings,
@@ -50,7 +52,7 @@ from confluence_markdown_exporter.utils.app_data_store import (
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
 _DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.15.72"
+_AGENT_VERSION = "0.15.73"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -822,6 +824,51 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="cme_confluence_search",
+            description=(
+                "Search the REMOTE Confluence server, live: one bounded CQL request using the "
+                "workspace's stored credentials, returning pages (title, type, space, URL) with a "
+                "short excerpt. This reaches the Atlassian server over HTTP — it does NOT read the "
+                "local workspace wiki, and it never exports anything. Use it to explore Confluence "
+                "directly, e.g. to find the page or space worth exporting. For the LOCAL wiki "
+                "knowledge already ingested into this workspace, use cme_wiki_search instead. "
+                "Provide either a free-text query (built as `text ~ \"...\"`) or an explicit CQL expression."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. Credentials are read from the agent state for this workspace."},
+                    "query": {"type": "string", "description": "Free-text search on Confluence (ignored when cql is provided)."},
+                    "cql": {"type": "string", "description": "Explicit Confluence CQL expression, e.g. 'type = page and space = DEV'."},
+                    "limit": {"type": "integer", "description": "Maximum results to return (default 10, max 50)."},
+                    "space_key": {"type": "string", "description": "Optional Confluence space key to restrict the search to."},
+                },
+                "required": ["workspace"],
+            },
+        ),
+        Tool(
+            name="cme_wiki_search",
+            description=(
+                "Search the LOCAL workspace wiki, live on disk: walks workspaces/<workspace>/wiki/ "
+                "Markdown pages, matches the query's tokens case- and accent-insensitively, and "
+                "returns the best pages with their title (first # heading) and a short excerpt. "
+                "This reads the workspace's OWN knowledge — it does NOT reach Confluence or any "
+                "remote server, builds no index and writes nothing. Use it to check what the local "
+                "wiki already covers before filing new sources. For the REMOTE Confluence server, "
+                "use cme_confluence_search instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace": {"type": "string", "description": "Workspace name. The wiki is read from the workspace directory."},
+                    "query": {"type": "string", "description": "Free-text query against the local wiki; every token must match a page for it to score."},
+                    "limit": {"type": "integer", "description": "Maximum results to return (default 10, max 30)."},
+                    "path_prefix": {"type": "string", "description": "Optional relative folder of the local wiki to restrict the search to, e.g. concepts."},
+                },
+                "required": ["workspace", "query"],
+            },
+        ),
+        Tool(
             name="cme_setup",
             description=(
                 "One-time agent-cme initialization: stores Confluence credentials and connection settings persistently. "
@@ -983,6 +1030,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result = await _tool_status(arguments)
             case "cme_test_connection":
                 result = await _tool_test_connection(arguments)
+            case "cme_confluence_search":
+                result = await _tool_confluence_search(arguments)
+            case "cme_wiki_search":
+                result = await _tool_wiki_search(arguments)
             case "cme_setup":
                 result = await _tool_setup(arguments)
             case "cme_sources_list":
@@ -1228,6 +1279,40 @@ def _probe_confluence(
         return f"reachable but HTTP {error.code}"
     except Exception as error:  # noqa: BLE001 - diagnostic, all failures reported
         return f"unreachable ({type(error).__name__}: {error})"
+
+
+async def _tool_confluence_search(args: dict) -> list[TextContent]:
+    """Live Confluence search (confluence_search.py) — read-only, one bounded call."""
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    with _cme_workspace_context(workspace):
+        settings = get_settings()
+    try:
+        payload = search_confluence(
+            settings,
+            query=args.get("query"),
+            cql=args.get("cql"),
+            limit=int(args.get("limit") or 10),
+            space_key=args.get("space_key"),
+        )
+        return [_json_content(payload)]
+    except ConfluenceSearchError as error:
+        return [_json_content({"ok": False, "error": search_error_message(error)})]
+
+
+async def _tool_wiki_search(args: dict) -> list[TextContent]:
+    """Live wiki search (wiki_search.py) — read-only, walks the workspace wiki."""
+    workspace = _workspace_name(str(args.get("workspace", "")).strip())
+    try:
+        payload = search_wiki(
+            _WORKSPACES_ROOT,
+            workspace,
+            str(args.get("query", "")),
+            limit=int(args.get("limit") or 10),
+            path_prefix=args.get("path_prefix"),
+        )
+        return [_json_content(payload)]
+    except WikiSearchError as error:
+        return [_json_content({"ok": False, "error": wiki_search_error_message(error)})]
 
 
 async def _tool_setup(args: dict) -> list[TextContent]:

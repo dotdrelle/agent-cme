@@ -163,12 +163,35 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 | ------------------- | ---------------------------------------------------------------------------------------- |
 | `cme_status`        | Check if CME is configured for one workspace. Always call this first.                    |
 | `cme_setup`         | Workspace initialization: credentials + connection settings.                             |
+| `cme_test_connection` | Live authenticated probe of the configured Confluence instance (real request, no export). |
+| `cme_confluence_search` | Live read-only Confluence search (free-text or CQL), using the stored credentials.    |
+| `cme_wiki_search`   | Live read-only search over the workspace `wiki/**/*.md` pages (title + excerpt).         |
 | `cme_sources_list`  | List configured export sources for one workspace.                                       |
 | `cme_source_add`    | Add or update a workspace export source (space, page, or page-with-descendants).         |
 | `cme_source_remove` | Remove a workspace export source by name.                                                |
 | `cme_export_run`    | Start an async workspace export. Returns JSON with `job_id`, status, sources, and `_activity`. |
 | `cme_export_cancel` | Cancel a running export job. Files already written before cancellation are left in place. |
 | `cme_export_status` | Check job progress, or show last-export summary. With `job_id`, returns `_activity`.      |
+
+### Live search (no export involved)
+
+The two `*_search` tools are separate components inside the same agent
+(`confluence_search.py` and `wiki_search.py`), both read-only:
+
+- `cme_confluence_search` runs one bounded CQL request against the configured
+  instance with the workspace's stored credentials (`text ~ "query"` is built
+  from a free-text query; pass `cql` for a full expression, `space_key` to
+  restrict it). Returns pages with title, type, space, URL and a short
+  excerpt. Use it to explore Confluence directly before deciding what to
+  export.
+- `cme_wiki_search` walks `workspaces/<workspace>/wiki/` on disk and matches
+  the query's tokens case- and accent-insensitively, returning the best pages
+  with their first-`#` title and an excerpt. No index is built, nothing is
+  written. Use it to check what the local wiki already covers before filing
+  new sources.
+
+Neither tool needs the write scope: they are deliberately absent from the
+write-only tool list.
 
 Orchestration contract (used by `llm-wiki-manager`'s generic orchestrator —
 executor-only agent, `canPlan: false`):

@@ -361,3 +361,118 @@ class CmeMcpServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_confluence_search_requires_configuration(self):
+        text = asyncio.run(self.server._tool_confluence_search({
+            "workspace": "demo", "query": "architecture",
+        }))[0].text
+        self.assertIn('"ok": false', text)
+        self.assertIn("not_configured", text)
+
+    def test_confluence_search_builds_cql_and_parses_results(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        captured = {}
+
+        def fake_urlopen(request, **kwargs):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.headers)
+
+            class FakeResponse:
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def read(self):
+                    return json.dumps({
+                        "totalSize": 1,
+                        "results": [{
+                            "content": {
+                                "id": "12345",
+                                "title": "Network architecture",
+                                "type": "page",
+                                "space": {"key": "DEV"},
+                                "_links": {"base": "https://confluence.example", "webui": "/display/DEV/Architecture"},
+                            },
+                            "excerpt": "an overview of the @@@hl@@@network@@@endhl@@@ on the server side",
+                        }],
+                    }).encode("utf-8")
+
+            return FakeResponse()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            text = asyncio.run(self.server._tool_confluence_search({
+                "workspace": "demo", "query": "network servers",
+            }))[0].text
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertIn('cql=text%20~%20%22r%C3%A9seau%20serveurs%22', captured["url"])
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer secret-pat")
+        self.assertEqual(payload["results"][0]["title"], "Network architecture")
+        self.assertEqual(payload["results"][0]["space"], "DEV")
+        self.assertEqual(
+            payload["results"][0]["url"],
+            "https://confluence.example/display/DEV/Architecture",
+        )
+        self.assertNotIn("@@@hl@@@", payload["results"][0]["excerpt"])
+        self.assertNotIn("secret-pat", text)
+
+    def test_confluence_search_reports_auth_failure(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        error = urllib.error.HTTPError("https://confluence.example/rest/api/search", 401, "Unauthorized", {}, None)
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            text = asyncio.run(self.server._tool_confluence_search({
+                "workspace": "demo", "query": "architecture",
+            }))[0].text
+        self.assertIn("auth_failed", text)
+
+    def test_wiki_search_finds_pages_and_reads_their_heading(self):
+        wiki = self.workspaces / "demo" / "wiki" / "concepts"
+        wiki.mkdir(parents=True)
+        (wiki / "reseau.md").write_text(
+            "# Network architecture\n\nDigital sovereignty of the internal servers.\n", encoding="utf-8"
+        )
+        (wiki / "budget.md").write_text("# Budget\n\nYearly forecast.\n", encoding="utf-8")
+
+        text = asyncio.run(self.server._tool_wiki_search({
+            "workspace": "demo", "query": "digital sovereignty",
+        }))[0].text
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["results"][0]["path"], "wiki/concepts/reseau.md")
+        self.assertEqual(payload["results"][0]["title"], "Network architecture")
+        self.assertIn("sovereignty", payload["results"][0]["excerpt"].lower())
+
+    def test_wiki_search_rejects_path_prefix_traversal(self):
+        text = asyncio.run(self.server._tool_wiki_search({
+            "workspace": "demo", "query": "anything", "path_prefix": "../agents-data",
+        }))[0].text
+        self.assertIn("invalid_prefix", text)
+
+    def test_wiki_search_reports_a_workspace_without_wiki(self):
+        text = asyncio.run(self.server._tool_wiki_search({
+            "workspace": "demo", "query": "anything",
+        }))[0].text
+        self.assertIn("no_wiki", text)
+
+    def test_search_tools_stay_read_only(self):
+        token = self.server._CURRENT_SCOPES.set({"read"})
+        try:
+            self.assertIsNone(self.server._require_tool_scope("cme_confluence_search"))
+            self.assertIsNone(self.server._require_tool_scope("cme_wiki_search"))
+        finally:
+            self.server._CURRENT_SCOPES.reset(token)
