@@ -17,6 +17,16 @@ RUN python3 patch_cme_urls.py && rm patch_cme_urls.py
 
 COPY cme_mcp_server.py .
 COPY cme_source_urls.py .
+# Read-only search components of the same agent, imported at module load by
+# cme_mcp_server.py. Missing one of them does not fail the build: the container
+# dies on ModuleNotFoundError at start and restarts forever (restart:
+# unless-stopped) — the manager then sees no CME agent at all.
+COPY confluence_search.py .
+COPY wiki_search.py .
+# Fail the BUILD, not the first start, when a helper module is missing or
+# broken: byte-compile every shipped module and resolve the helper imports.
+RUN python -m py_compile cme_mcp_server.py cme_source_urls.py confluence_search.py wiki_search.py \
+    && python -c "import cme_source_urls, confluence_search, wiki_search"
 
 ENV CME_DATA_DIR=/data
 ENV MCP_HOST=0.0.0.0
