@@ -19,14 +19,16 @@ services:
 
   # CLI one-shot pour configurer CME directement (profil cli).
   # Exemples :
-  #   CME_WORKSPACE=my-project docker compose run --rm cme-cli configure
-  #   CME_WORKSPACE=my-project docker compose run --rm cme-cli export
+  #   docker compose run --rm cme-cli config
+  #   docker compose run --rm cme-cli export
+  # Le config est agent-wide (partagé entre tous les workspaces) : plus de
+  # CME_WORKSPACE.
   cme-cli:
     build: .
     profiles: [cli]
     entrypoint: cme
     environment:
-      - CME_CONFIG_PATH=/data/${CME_WORKSPACE:-__set_CME_WORKSPACE__}/cme/app_data.json
+      - CME_CONFIG_PATH=/data/app_data.json
       - WORKSPACES_ROOT=/workspaces
     volumes:
       - ./data:/data

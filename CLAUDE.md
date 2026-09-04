@@ -6,9 +6,10 @@ the coordinated workspace stack.
 ## Goal
 
 `agent-cme` exposes `confluence-markdown-exporter` as an MCP Streamable HTTP
-server. It lets an orchestrating agent configure Confluence export sources per
-workspace, start asynchronous exports, monitor jobs, and write Markdown files
-into a local export directory.
+server. It lets an orchestrating agent configure Confluence credentials
+agent-wide (shared across all workspaces, keyed by instance base URL), manage
+export sources per workspace, start asynchronous exports, monitor jobs, and
+write Markdown files into a local export directory.
 
 Since 0.12.0 it is also an **executor-only orchestrable agent** for the
 manager's agnostic orchestration: it implements `agent_describe`
@@ -40,8 +41,9 @@ retry with a known `idempotencyKey` returns the existing job or result.
 - `docker-compose.yml`: global service and CLI profile. It mounts the shared
   workspaces root at `/workspaces`; each export receives the target workspace
   as a tool argument.
-- `data/`: runtime state when running standalone. It contains per-workspace
-  credentials, source manifests, exports, and job state and is not source.
+- `data/`: runtime state when running standalone. It contains the agent-wide
+  credentials config (`app_data.json`), per-workspace source manifests,
+  exports, and job state and is not source.
 
 ## Constraints
 
@@ -62,9 +64,16 @@ retry with a known `idempotencyKey` returns the existing job or result.
   additive `_activity` metadata so managers can poll progress through
   `cme.cme_export_status` without parsing CME-specific text.
 - Keep `agent-cme` workspace-agnostic. Workspace names are request parameters,
-  not container configuration. Runtime CME state is namespaced directly under
-  `/data/<workspace>/`, for example `/data/my-project/cme/app_data.json` and
-  `/data/my-project/sources-manifest.yaml`.
+  not container configuration. **Credentials and connection settings are
+  agent-wide**: they live in the single shared config
+  `/data/app_data.json`, keyed by Confluence base URL, and are written by
+  `cme_setup` (the `workspace` argument is accepted for compatibility but does
+  not scope the write). Per-workspace state is the sources manifest
+  (`/data/<workspace>/sources-manifest.yaml`), the export output and the export
+  lock. At startup, legacy per-workspace configs
+  (`/data/<workspace>/cme/app_data.json`) are merged into the shared config
+  (first instance wins; conflicts and skips are announced in the log) and
+  renamed `app_data.json.migrated`.
 - When managed by `llm-wiki-manager`, the active `/use <workspace>` is injected
   automatically on every `cme_*` call (except `cme_export_cancel` and
   `cme_export_status(job_id=...)`). Direct MCP callers must pass `workspace` on

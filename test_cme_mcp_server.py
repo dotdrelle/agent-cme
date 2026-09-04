@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import importlib.util
 import json
 import os
@@ -96,9 +97,19 @@ def install_stubs():
     utils = types.ModuleType("confluence_markdown_exporter.utils")
     app_data_store = types.ModuleType("confluence_markdown_exporter.utils.app_data_store")
     app_data_store.APP_CONFIG_PATH = None
+
+    def persist():
+        # Mirror the real app_data_store: set_setting writes the config file
+        # (creating missing parent dirs), so tests can assert disk behaviour
+        # such as "a missing config is recreated by cme_setup".
+        path = app_data_store.APP_CONFIG_PATH
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(json.dumps(STORE), encoding="utf-8")
+
     app_data_store.get_settings = lambda: Settings()
-    app_data_store.set_setting = lambda key, value: set_nested(key.split("."), value)
-    app_data_store.set_setting_with_keys = lambda keys, value: set_nested(list(keys), value)
+    app_data_store.set_setting = lambda key, value: (set_nested(key.split("."), value), persist())[1]
+    app_data_store.set_setting_with_keys = lambda keys, value: (set_nested(list(keys), value), persist())[1]
     utils.app_data_store = app_data_store
     sys.modules.update({
         "confluence_markdown_exporter": exporter,
@@ -358,10 +369,6 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertEqual(cancelled["result"]["status"], "cancelled")
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_confluence_search_requires_configuration(self):
         text = asyncio.run(self.server._tool_confluence_search({
             "workspace": "demo", "query": "architecture",
@@ -414,8 +421,9 @@ if __name__ == "__main__":
             }))[0].text
         payload = json.loads(text)
         self.assertTrue(payload["ok"])
-        self.assertIn('cql=text%20~%20%22r%C3%A9seau%20serveurs%22', captured["url"])
+        self.assertIn('cql=text+~+%22network+servers%22', captured["url"])
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer secret-pat")
+        self.assertEqual(payload["instance"], "https://confluence.example")
         self.assertEqual(payload["results"][0]["title"], "Network architecture")
         self.assertEqual(payload["results"][0]["space"], "DEV")
         self.assertEqual(
@@ -438,6 +446,78 @@ if __name__ == "__main__":
                 "workspace": "demo", "query": "architecture",
             }))[0].text
         self.assertIn("auth_failed", text)
+
+    def test_confluence_search_uses_the_workspace_source_instance(self):
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://alpha.example",
+            "username": "user@example.com",
+            "pat": "pat-alpha",
+        }))
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://beta.example",
+            "username": "user@example.com",
+            "pat": "pat-beta",
+        }))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "alpha-docs",
+            "type": "space",
+            "base_url": "https://alpha.example",
+            "space": "DEV",
+        }))
+        captured = {}
+
+        def fake_urlopen(request, **kwargs):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.headers)
+
+            class FakeResponse:
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def read(self):
+                    return json.dumps({"totalSize": 0, "results": []}).encode("utf-8")
+
+            return FakeResponse()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            text = asyncio.run(self.server._tool_confluence_search({
+                "workspace": "demo", "query": "anything",
+            }))[0].text
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["instance"], "https://alpha.example")
+        self.assertTrue(captured["url"].startswith("https://alpha.example/"))
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer pat-alpha")
+
+    def test_confluence_search_names_the_instance_that_lacks_credentials(self):
+        # One instance IS configured — the workspace's source just points at a
+        # different one. That must be announced by name, not folded into a
+        # generic "not configured".
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://alpha.example",
+            "username": "user@example.com",
+            "pat": "pat-alpha",
+        }))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "beta-docs",
+            "type": "space",
+            "base_url": "https://beta.example",
+            "space": "DEV",
+        }))
+        text = asyncio.run(self.server._tool_confluence_search({
+            "workspace": "demo", "query": "anything",
+        }))[0].text
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertIn("instance_not_configured", payload["error"])
+        self.assertEqual(payload["instance"], "https://beta.example/display/DEV")
 
     def test_wiki_search_finds_pages_and_reads_their_heading(self):
         wiki = self.workspaces / "demo" / "wiki" / "concepts"
@@ -476,3 +556,210 @@ if __name__ == "__main__":
             self.assertIsNone(self.server._require_tool_scope("cme_wiki_search"))
         finally:
             self.server._CURRENT_SCOPES.reset(token)
+
+    # ------------------------------------------------------------------
+    # Agent-wide (shared) configuration
+    # ------------------------------------------------------------------
+
+    def test_setup_stores_credentials_agent_wide_and_workspace_is_optional(self):
+        first = asyncio.run(self.server._tool_setup({
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))[0].text
+        # The manager injects workspace on every call — it must stay accepted
+        # but must NOT scope the write.
+        second = asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://other.example",
+            "username": "user@example.com",
+            "pat": "secret-pat-2",
+        }))[0].text
+        status = asyncio.run(self.server._tool_status({"workspace": "demo"}))[0].text
+
+        self.assertIn("OK: CME configured", first)
+        self.assertIn("OK: CME configured", second)
+        self.assertIn("shared across all workspaces", first)
+        self.assertIn("status: configured", status)
+        self.assertIn("https://confluence.example", status)
+        self.assertIn("https://other.example", status)
+        self.assertIn("auth=pat", status)
+        self.assertNotIn("secret-pat", status)
+
+    def test_status_reports_the_shared_config_path(self):
+        asyncio.run(self.server._tool_setup({
+            "workspace": "demo",
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        status = asyncio.run(self.server._tool_status({"workspace": "demo"}))[0].text
+        self.assertIn("shared across all workspaces", status)
+        self.assertIn(str(self.server._global_cme_config()), status)
+
+    def test_export_run_refuses_sources_without_stored_credentials(self):
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "dev-docs",
+            "type": "space",
+            "base_url": "https://confluence.example",
+            "space": "DEV",
+        }))
+        result = asyncio.run(self.server._tool_export_run({"workspace": "demo"}))[0].text
+        self.assertIn("no stored Confluence credentials", result)
+        self.assertIn("dev-docs", result)
+        self.assertIn("https://confluence.example", result)
+
+    def test_export_run_preflight_passes_with_shared_credentials(self):
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "dev-docs",
+            "type": "space",
+            "base_url": "https://confluence.example",
+            "space": "DEV",
+        }))
+        # Never spawn the real CME binary: the job must fail its first step.
+        self.server._CME_BIN = "/nonexistent/cme-bin"
+
+        async def _run_and_stop():
+            result = await self.server._tool_export_run({"workspace": "demo"})
+            job_id = json.loads(result[0].text)["job_id"]
+            job = self.server._jobs[job_id]
+            if job.get("task") and not job["task"].done():
+                job["task"].cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await job["task"]
+            return result, job_id
+
+        result, job_id = asyncio.run(_run_and_stop())
+        payload = json.loads(result[0].text)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.server._jobs[job_id]["config_path"], str(self.server._global_cme_config()))
+
+    def test_migration_merges_legacy_workspace_configs_into_the_shared_one(self):
+        legacy_a = self.server._DATA_DIR / "old-a" / "cme" / "app_data.json"
+        legacy_a.parent.mkdir(parents=True)
+        legacy_a.write_text(json.dumps({
+            "auth": {"confluence": {"https://a.example": {"username": "u", "pat": "pat-a"}}},
+            "connection_config": {"verify_ssl": False},
+            "export": {"attachments_export": "referenced"},
+        }), encoding="utf-8")
+        legacy_b = self.server._DATA_DIR / "old-b" / "cme" / "app_data.json"
+        legacy_b.parent.mkdir(parents=True)
+        legacy_b.write_text(json.dumps({
+            "auth": {"confluence": {"https://b.example": {"username": "u", "api_token": "tok-b"}}},
+        }), encoding="utf-8")
+
+        notices = self.server._migrate_legacy_workspace_configs()
+
+        shared = json.loads((self.server._DATA_DIR / "app_data.json").read_text(encoding="utf-8"))
+        self.assertEqual(shared["auth"]["confluence"]["https://a.example"]["pat"], "pat-a")
+        self.assertEqual(shared["auth"]["confluence"]["https://b.example"]["api_token"], "tok-b")
+        self.assertFalse(shared["connection_config"]["verify_ssl"])
+        self.assertEqual(shared["export"]["attachments_export"], "referenced")
+        self.assertFalse(legacy_a.exists())
+        self.assertTrue(legacy_a.with_name("app_data.json.migrated").exists())
+        self.assertTrue(any("old-a" in n for n in notices))
+        self.assertTrue(any("old-b" in n for n in notices))
+
+    def test_migration_adopts_the_former_shared_cme_location(self):
+        # The intermediate pre-release layout stored the shared config at
+        # /data/cme/app_data.json. Its credentials must be adopted, not
+        # orphaned, when the shared config moves to /data/app_data.json.
+        former = self.server._DATA_DIR / "cme" / "app_data.json"
+        former.parent.mkdir(parents=True)
+        former.write_text(json.dumps({
+            "auth": {"confluence": {"https://x.example": {"username": "u", "pat": "pat-x"}}},
+        }), encoding="utf-8")
+
+        notices = self.server._migrate_legacy_workspace_configs()
+
+        shared = json.loads((self.server._DATA_DIR / "app_data.json").read_text(encoding="utf-8"))
+        self.assertEqual(shared["auth"]["confluence"]["https://x.example"]["pat"], "pat-x")
+        self.assertTrue(former.with_name("app_data.json.migrated").exists())
+        self.assertTrue(any("cme" in n for n in notices))
+
+    def test_status_and_setup_survive_a_missing_data_dir(self):
+        # A fresh deployment (or an operator who cleared the state dir) has no
+        # data directory at all: reads degrade to not_configured and the first
+        # cme_setup recreates the agent-wide config, parent dirs included.
+        self.assertFalse(self.server._DATA_DIR.exists())
+        status = asyncio.run(self.server._tool_status({"workspace": "demo"}))[0].text
+        self.assertIn("not_configured", status)
+        self.assertIn("action_required: call cme_setup", status)
+
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        self.assertTrue((self.server._DATA_DIR / "app_data.json").is_file())
+
+    def test_sources_list_recreates_a_missing_manifest(self):
+        # The per-workspace sources manifest is runtime state: when it is gone
+        # (fresh workspace, cleared state), a read recreates the empty file
+        # instead of failing or inventing sources.
+        manifest_path = self.server._workspace_manifest("demo")
+        self.assertFalse(manifest_path.exists())
+        text = asyncio.run(self.server._tool_sources_list({"workspace": "demo"}))[0].text
+        self.assertIn("sources: []", text)
+        self.assertTrue(manifest_path.is_file())
+
+    def test_migrated_files_are_not_remerged_when_the_shared_config_is_deleted(self):
+        # Deleting the shared config must NOT resurrect credentials from the
+        # .migrated legacy files: those were consumed once, and the absence of
+        # the shared config is a state the status announces (not_configured),
+        # never one migration silently rebuilds.
+        legacy_a = self.server._DATA_DIR / "old-a" / "cme" / "app_data.json"
+        legacy_a.parent.mkdir(parents=True)
+        legacy_a.write_text(json.dumps({
+            "auth": {"confluence": {"https://a.example": {"username": "u", "pat": "pat-a"}}},
+        }), encoding="utf-8")
+        self.server._migrate_legacy_workspace_configs()
+        shared = self.server._DATA_DIR / "app_data.json"
+        self.assertTrue(shared.is_file())
+        shared.unlink()
+
+        notices = self.server._migrate_legacy_workspace_configs()
+        status = asyncio.run(self.server._tool_status({"workspace": "demo"}))[0].text
+
+        self.assertEqual(notices, [])
+        self.assertFalse(shared.exists())
+        self.assertIn("not_configured", status)
+
+    def test_migration_keeps_existing_credentials_and_announces_conflicts(self):
+        legacy_a = self.server._DATA_DIR / "old-a" / "cme" / "app_data.json"
+        legacy_a.parent.mkdir(parents=True)
+        legacy_a.write_text(json.dumps({
+            "auth": {"confluence": {"https://a.example": {"username": "u", "pat": "pat-a"}}},
+        }), encoding="utf-8")
+        self.server._migrate_legacy_workspace_configs()
+
+        legacy_b = self.server._DATA_DIR / "old-b" / "cme" / "app_data.json"
+        legacy_b.parent.mkdir(parents=True)
+        legacy_b.write_text(json.dumps({
+            "auth": {"confluence": {"https://a.example": {"username": "u", "pat": "pat-different"}}},
+        }), encoding="utf-8")
+        legacy_c = self.server._DATA_DIR / "old-c" / "cme" / "app_data.json"
+        legacy_c.parent.mkdir(parents=True)
+        legacy_c.write_text(json.dumps({
+            "auth": {"confluence": {"https://a.example": {"username": "u", "pat": "pat-a"}}},
+        }), encoding="utf-8")
+
+        notices = self.server._migrate_legacy_workspace_configs()
+
+        shared = json.loads((self.server._DATA_DIR / "app_data.json").read_text(encoding="utf-8"))
+        self.assertEqual(shared["auth"]["confluence"]["https://a.example"]["pat"], "pat-a")
+        self.assertTrue(any("DIFFERENT credentials" in n for n in notices))
+        self.assertTrue(any("identical credentials" in n for n in notices))
+        self.assertTrue(legacy_b.with_name("app_data.json.migrated").exists())
+        self.assertTrue(legacy_c.with_name("app_data.json.migrated").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

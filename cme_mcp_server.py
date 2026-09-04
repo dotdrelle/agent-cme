@@ -40,7 +40,12 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from cme_source_urls import extract_confluence_url, parse_confluence_source_url
-from confluence_search import ConfluenceSearchError, search_confluence, search_error_message
+from confluence_search import (
+    ConfluenceSearchError,
+    match_confluence_instance,
+    search_confluence,
+    search_error_message,
+)
 from wiki_search import WikiSearchError, search_wiki, wiki_search_error_message
 from confluence_markdown_exporter.utils import app_data_store
 from confluence_markdown_exporter.utils.app_data_store import (
@@ -50,9 +55,26 @@ from confluence_markdown_exporter.utils.app_data_store import (
 )
 
 # CME_DATA_DIR separates runtime data from code (required in Docker, optional locally)
-_DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent)))
+_DATA_DIR = Path(os.environ.get("CME_DATA_DIR", str(Path(__file__).parent))).resolve()
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
-_AGENT_VERSION = "0.15.76"
+
+
+def _global_cme_config() -> Path:
+    """The single agent-wide CME config file.
+
+    Credentials and connection settings belong to the operator's Confluence
+    account, not to a workspace — they are shared across every workspace the
+    agent serves. Only the sources manifest, the export output and the export
+    lock remain per-workspace.
+    """
+    return _DATA_DIR / "app_data.json"
+
+
+# Point the CME library at the shared config once, at import time: the old
+# per-workspace context manager switched APP_CONFIG_PATH around every call.
+os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
+app_data_store.APP_CONFIG_PATH = _global_cme_config()
+_AGENT_VERSION = "0.15.77"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -175,8 +197,8 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         ("agent_status", "Read one orchestrated CME export task status."),
         ("agent_cancel", "Cancel one orchestrated CME export task."),
         ("cme_status", "Check agent-cme runtime configuration and readiness."),
-        ("cme_test_connection", "Test the live Confluence connection for a workspace."),
-        ("cme_setup", "Store agent-cme Confluence credentials and connection settings."),
+        ("cme_test_connection", "Test the live Confluence connections for all configured instances."),
+        ("cme_setup", "Store agent-wide Confluence credentials and connection settings."),
         ("cme_sources_list", "List agent-cme configured Confluence export sources."),
         ("cme_source_add", "Add or update a Confluence export source."),
         ("cme_source_remove", "Remove an export source by name."),
@@ -237,7 +259,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     <section class="panel">
       <h2>Available tools</h2>
       <ul>{tools}</ul>
-      <p class="note">First-run workflow: call <code>cme_status(workspace=...)</code>, then <code>cme_setup(workspace=...)</code> if credentials are not configured. Export jobs can be cancelled with <code>cme_export_cancel</code>; files already written before cancellation are left in place.</p>
+      <p class="note">First-run workflow: call <code>cme_status</code>, then <code>cme_setup</code> if credentials are not configured (once per Confluence instance — credentials are shared across all workspaces, sources stay per-workspace). Export jobs can be cancelled with <code>cme_export_cancel</code>; files already written before cancellation are left in place.</p>
     </section>
   </main>
 </body>
@@ -308,26 +330,155 @@ def _workspace_manifest(workspace: str) -> Path:
     return _workspace_data_dir(workspace) / "sources-manifest.yaml"
 
 
-def _workspace_cme_config(workspace: str) -> Path:
-    return _workspace_data_dir(workspace) / "cme" / "app_data.json"
+def _workspace_untracked(workspace: str) -> Path:
+    return _validate_workspace(workspace) / "raw" / "untracked"
 
 
-@contextlib.contextmanager
-def _cme_workspace_context(workspace: str):
-    config_path = _workspace_cme_config(workspace)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    old_value = os.environ.get("CME_CONFIG_PATH")
-    old_app_config_path = app_data_store.APP_CONFIG_PATH
-    os.environ["CME_CONFIG_PATH"] = str(config_path)
-    app_data_store.APP_CONFIG_PATH = config_path
+def _confluence_instances(settings: Any) -> dict[str, dict[str, Any]]:
+    """The URL-keyed Confluence credentials dict from the shared config."""
+    data = json.loads(settings.model_dump_json())
+    confluence = data.get("auth", {}).get("confluence", {})
+    return {
+        str(url): creds
+        for url, creds in confluence.items()
+        if isinstance(creds, dict) and (creds.get("pat") or creds.get("api_token"))
+    }
+
+
+def _workspace_source_url(workspace: str, settings: Any) -> str | None:
+    """The URL of the first source the workspace declares.
+
+    Read-only by design (cme_confluence_search must stay a read tool): the
+    manifest is read soft, never created. Search pins its instance on this
+    URL — configured or not, so a missing instance is announced by name
+    instead of silently searching another one. None when the workspace
+    declares no source; search then falls back to the agent-wide configured
+    instance(s).
+    """
+    manifest_path = _workspace_manifest(workspace)
+    if not manifest_path.exists():
+        return None
     try:
-        yield _workspace_data_dir(workspace)
-    finally:
-        app_data_store.APP_CONFIG_PATH = old_app_config_path
-        if old_value is None:
-            os.environ.pop("CME_CONFIG_PATH", None)
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    exports = manifest.get("exports") or []
+    if not isinstance(exports, list):
+        return None
+    for entry in exports:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            return _source_url(entry)
+        except (KeyError, TypeError):
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Legacy per-workspace config migration
+# ---------------------------------------------------------------------------
+
+def _legacy_workspace_config_paths() -> list[tuple[str, Path]]:
+    """`/data/<workspace>/cme/app_data.json` files from the pre-shared layout."""
+    found: list[tuple[str, Path]] = []
+    if not _DATA_DIR.is_dir():
+        return found
+    for entry in sorted(_DATA_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if entry.name == "jobs":
+            continue
+        candidate = entry / "cme" / "app_data.json"
+        if candidate.is_file():
+            found.append((entry.name, candidate))
+    return found
+
+
+def _creds_fingerprint(creds: dict[str, Any]) -> dict[str, str]:
+    return {key: str(creds.get(key) or "") for key in ("username", "api_token", "pat")}
+
+
+def _merge_legacy_config(target: dict[str, Any], source: dict[str, Any], label: str) -> list[str]:
+    """Merge one legacy workspace config into the shared one. First wins.
+
+    Returns notices for every case where something was skipped or ignored — a
+    credential that could not be carried over must be announced, never dropped
+    in silence.
+    """
+    notices: list[str] = []
+    confluence = target.setdefault("auth", {}).setdefault("confluence", {})
+    jira = (source.get("auth") or {}).get("jira") or {}
+    if jira:
+        notices.append(f"{label}: auth.jira ignored (agent-cme never manages Jira credentials)")
+    for url, creds in (source.get("auth") or {}).get("confluence", {}).items():
+        if not isinstance(creds, dict):
+            continue
+        key = str(url).rstrip("/")
+        existing = confluence.get(key)
+        if isinstance(existing, dict) and (existing.get("pat") or existing.get("api_token")):
+            if _creds_fingerprint(existing) == _creds_fingerprint(creds):
+                notices.append(f"{label}: instance {key} already configured with identical credentials — skipped")
+            else:
+                notices.append(f"{label}: instance {key} already configured with DIFFERENT credentials — kept existing, legacy file preserved")
+            continue
+        confluence[key] = dict(creds)
+    for field, value in ((source.get("connection_config") or {}).items()):
+        target.setdefault("connection_config", {}).setdefault(field, value)
+    attachments = (source.get("export") or {}).get("attachments_export")
+    if attachments:
+        target.setdefault("export", {}).setdefault("attachments_export", attachments)
+    return notices
+
+
+def _migrate_legacy_workspace_configs() -> list[str]:
+    """Merge pre-shared per-workspace configs into the agent-wide config.
+
+    Each merged legacy file is renamed `app_data.json.migrated` so the merge
+    happens exactly once and no credential is destroyed by the move. Never
+    called implicitly by a tool: it runs at startup, and tests call it
+    directly.
+    """
+    notices: list[str] = []
+    legacy = _legacy_workspace_config_paths()
+    # The intermediate shared-location candidate (`/data/cme/app_data.json`,
+    # used by pre-release working trees and old standalone dev data) sits one
+    # level under the legacy layout. Adopt it like any other legacy config
+    # rather than orphaning its credentials.
+    former_shared = _DATA_DIR / "cme" / "app_data.json"
+    if former_shared.is_file():
+        legacy.insert(0, ("cme", former_shared))
+    if not legacy:
+        return notices
+    global_path = _global_cme_config()
+    merged: dict[str, Any] = {}
+    if global_path.is_file():
+        try:
+            loaded = json.loads(global_path.read_text(encoding="utf-8"))
+        except Exception:
+            loaded = None
+        if isinstance(loaded, dict):
+            merged = loaded
+    for name, path in legacy:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            notices.append(f"{name}: unreadable legacy config skipped ({exc})")
+            continue
+        if not isinstance(payload, dict):
+            notices.append(f"{name}: legacy config is not a JSON object — skipped")
+            continue
+        before = json.dumps(merged, sort_keys=True)
+        notices.extend(_merge_legacy_config(merged, payload, name))
+        changed = json.dumps(merged, sort_keys=True) != before
+        if changed or not global_path.is_file():
+            _write_json(global_path, merged)
+        path.replace(path.with_name("app_data.json.migrated"))
+        if changed:
+            notices.append(f"{name}: credentials merged into {global_path} — legacy file kept as app_data.json.migrated")
         else:
-            os.environ["CME_CONFIG_PATH"] = old_value
+            notices.append(f"{name}: nothing new to merge — legacy file kept as app_data.json.migrated")
+    return notices
 
 
 def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
@@ -791,36 +942,38 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="cme_status",
             description=(
-                "Check agent-cme runtime configuration and readiness for one workspace. "
+                "Check agent-cme runtime configuration and readiness. "
                 "Use this for questions about the agent-cme agent/server config, Confluence credentials, SSL/API mode, or last export state. "
                 "Do not use wiki tools for live agent-cme configuration. "
                 "Call this first — returns 'configured' or 'not_configured'. "
-                "If not_configured, call cme_setup before doing anything else."
+                "If not_configured, call cme_setup before doing anything else. "
+                "Credentials are agent-wide: they are shared across all workspaces; only the last-export summary is workspace-scoped."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Agent configuration is stored in agent state; exports are written to the workspace raw/untracked directory."},
+                    "workspace": {"type": "string", "description": "Workspace name. Only scopes the last-export lock summary; credentials and connection settings are agent-wide."},
                 },
-                "required": ["workspace"],
+                "required": [],
             },
         ),
         Tool(
             name="cme_test_connection",
             description=(
-                "Test the live Confluence connection for one workspace: performs a real "
-                "authenticated request against the configured base URL and reports whether "
+                "Test the live Confluence connection: performs a real "
+                "authenticated request against each configured base URL and reports whether "
                 "credentials, SSL mode and reachability work. Use this after cme_setup, or "
                 "when an export fails at the preflight stage, to distinguish bad credentials "
                 "from an unreachable or SSL-mismatched server. Unlike cme_status (which only "
-                "reports whether credentials are stored), this actually reaches Confluence."
+                "reports whether credentials are stored), this actually reaches Confluence. "
+                "Credentials are agent-wide (shared across all workspaces)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Credentials are read from the agent state for this workspace."},
+                    "workspace": {"type": "string", "description": "Workspace name. Only reported back in the reply; the tested credentials are agent-wide."},
                 },
-                "required": ["workspace"],
+                "required": [],
             },
         ),
         Tool(
@@ -837,7 +990,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Credentials are read from the agent state for this workspace."},
+                    "workspace": {"type": "string", "description": "Workspace name. Credentials are agent-wide (shared across all workspaces); this scopes which workspace's sources are searched."},
                     "query": {"type": "string", "description": "Free-text search on Confluence (ignored when cql is provided)."},
                     "cql": {"type": "string", "description": "Explicit Confluence CQL expression, e.g. 'type = page and space = DEV'."},
                     "limit": {"type": "integer", "description": "Maximum results to return (default 10, max 50)."},
@@ -872,15 +1025,17 @@ async def list_tools() -> list[Tool]:
             name="cme_setup",
             description=(
                 "One-time agent-cme initialization: stores Confluence credentials and connection settings persistently. "
-                "Use this only to configure the live agent-cme Confluence exporter, not to edit llm-wiki markdown pages. "
-                "After setup the server is autonomous — no reconfiguration needed on restart. "
+                "Credentials are AGENT-WIDE: they are stored once for the whole agent and shared across all workspaces "
+                "(keyed by base_url — call again per distinct Confluence instance). Export sources remain per-workspace "
+                "(cme_source_add). Use this only to configure the live agent-cme Confluence exporter, not to edit "
+                "llm-wiki markdown pages. After setup the server is autonomous — no reconfiguration needed on restart. "
                 "Always provide username as the Confluence email/login. "
                 "Provide pat (self-hosted PAT) or api_token (Atlassian Cloud)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "workspace": {"type": "string", "description": "Workspace name. Agent configuration is stored in agent state; exports are written to the workspace raw/untracked directory."},
+                    "workspace": {"type": "string", "description": "Optional workspace name (accepted for compatibility, ignored — credentials are agent-wide)."},
                     "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.example.com"},
                     "username": {"type": "string", "description": "Confluence email address or login"},
                     "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
@@ -890,10 +1045,10 @@ async def list_tools() -> list[Tool]:
                     "attachments_export": {
                         "type": "string",
                         "enum": ["referenced", "all", "disabled"],
-                        "description": "Which page attachments to download during export (default: disabled).",
+                        "description": "Which page attachments to download during export (default: disabled). Agent-wide.",
                     },
                 },
-                "required": ["workspace", "base_url", "username"],
+                "required": ["base_url", "username"],
             },
         ),
         Tool(
@@ -1169,9 +1324,9 @@ async def _tool_agent_cancel(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _tool_status(args: dict) -> list[TextContent]:
-    workspace = _workspace_name(str(args.get("workspace", "")).strip())
-    with _cme_workspace_context(workspace):
-        settings = get_settings()
+    workspace = str(args.get("workspace") or "").strip()
+    workspace_path = _validate_workspace(workspace) if workspace else None
+    settings = get_settings()
     data = json.loads(settings.model_dump_json())
     confluence = data.get("auth", {}).get("confluence", {})
     instances = {
@@ -1179,17 +1334,18 @@ async def _tool_status(args: dict) -> list[TextContent]:
             "auth": "pat" if creds.get("pat") else ("username+api_token" if creds.get("api_token") else "incomplete"),
         }
         for url, creds in confluence.items()
-        if creds.get("pat") or creds.get("api_token")
+        if isinstance(creds, dict) and (creds.get("pat") or creds.get("api_token"))
     }
     configured = bool(instances)
     lines = [
         f"status: {'configured' if configured else 'not_configured'}",
         f"version: {_AGENT_VERSION}",
-        f"workspace: {workspace}",
         f"workspaces_root: {_WORKSPACES_ROOT}",
-        f"data_dir: {_workspace_data_dir(workspace)}",
-        f"config_path: {_workspace_cme_config(workspace)}",
+        f"data_dir: {_DATA_DIR}",
+        f"config_path: {_global_cme_config()} (shared across all workspaces)",
     ]
+    if workspace_path:
+        lines.append(f"workspace: {workspace}")
     if configured:
         for url, info in instances.items():
             lines.append(f"  {url}  auth={info['auth']}")
@@ -1197,34 +1353,31 @@ async def _tool_status(args: dict) -> list[TextContent]:
         lines.append(f"verify_ssl: {conn.get('verify_ssl', True)}")
         lines.append(f"use_v2_api: {conn.get('use_v2_api', False)}")
         lines.append(f"attachments_export: {data.get('export', {}).get('attachments_export', 'disabled')}")
-        with _cme_workspace_context(workspace):
-            lock = _lock_summary()
-        if lock.get("last_export"):
-            lines.append(f"last_export: {lock['last_export']}")
+        if workspace_path:
+            lock = _lock_summary(workspace_path / "raw" / "untracked")
+            if lock.get("last_export"):
+                lines.append(f"last_export: {lock['last_export']}")
     else:
         lines.append("action_required: call cme_setup to initialize")
     return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def _tool_test_connection(args: dict) -> list[TextContent]:
-    workspace = _workspace_name(str(args.get("workspace", "")).strip())
-    with _cme_workspace_context(workspace):
-        settings = get_settings()
-    data = json.loads(settings.model_dump_json())
-    confluence = data.get("auth", {}).get("confluence", {})
-    instances = {
-        url: creds
-        for url, creds in confluence.items()
-        if creds.get("pat") or creds.get("api_token")
-    }
+    workspace = str(args.get("workspace") or "").strip()
+    settings = get_settings()
+    instances = _confluence_instances(settings)
     if not instances:
         return [TextContent(type="text", text=(
-            "not_configured: no Confluence instance for this workspace. Call cme_setup first."
+            "not_configured: no Confluence instance configured for the agent. Call cme_setup first."
         ))]
+    data = json.loads(settings.model_dump_json())
     conn = data.get("connection_config", {})
     verify_ssl = bool(conn.get("verify_ssl", True))
     use_v2_api = bool(conn.get("use_v2_api", False))
-    lines = ["workspace: " + workspace]
+    lines = []
+    if workspace:
+        lines.append("workspace: " + workspace)
+    lines.append("credentials: agent-wide (shared across all workspaces)")
     for url, creds in instances.items():
         result = await asyncio.to_thread(
             _probe_confluence, str(url), creds, verify_ssl, use_v2_api
@@ -1284,8 +1437,8 @@ def _probe_confluence(
 async def _tool_confluence_search(args: dict) -> list[TextContent]:
     """Live Confluence search (confluence_search.py) — read-only, one bounded call."""
     workspace = _workspace_name(str(args.get("workspace", "")).strip())
-    with _cme_workspace_context(workspace):
-        settings = get_settings()
+    settings = get_settings()
+    source_url = _workspace_source_url(workspace, settings)
     try:
         payload = search_confluence(
             settings,
@@ -1293,10 +1446,14 @@ async def _tool_confluence_search(args: dict) -> list[TextContent]:
             cql=args.get("cql"),
             limit=int(args.get("limit") or 10),
             space_key=args.get("space_key"),
+            base_url=source_url,
         )
         return [_json_content(payload)]
     except ConfluenceSearchError as error:
-        return [_json_content({"ok": False, "error": search_error_message(error)})]
+        payload = {"ok": False, "error": search_error_message(error)}
+        if str(error) == "instance_not_configured":
+            payload["instance"] = source_url
+        return [_json_content(payload)]
 
 
 async def _tool_wiki_search(args: dict) -> list[TextContent]:
@@ -1316,7 +1473,6 @@ async def _tool_wiki_search(args: dict) -> list[TextContent]:
 
 
 async def _tool_setup(args: dict) -> list[TextContent]:
-    workspace = _workspace_name(str(args.get("workspace", "")).strip())
     base_url: str = args["base_url"].rstrip("/")
     username: str = str(args.get("username", "")).strip()
     pat: str = args.get("pat", "")
@@ -1324,31 +1480,34 @@ async def _tool_setup(args: dict) -> list[TextContent]:
     verify_ssl: bool = args.get("verify_ssl", True)
     use_v2_api: bool = args.get("use_v2_api", False)
     attachments_export: str = args.get("attachments_export", "disabled")
+    workspace = str(args.get("workspace") or "").strip()
     try:
+        if workspace:
+            _workspace_name(workspace)
         if not username:
             return [TextContent(type="text", text="Error: username is required. Provide the Confluence email address or login.")]
         if attachments_export not in {"referenced", "all", "disabled"}:
             return [TextContent(type="text", text="Error: attachments_export must be one of: referenced, all, disabled.")]
-        with _cme_workspace_context(workspace):
-            set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
-            if pat:
-                set_setting_with_keys(["auth", "confluence", base_url, "pat"], pat)
-            if api_token:
-                set_setting_with_keys(["auth", "confluence", base_url, "api_token"], api_token)
-            set_setting("connection_config.verify_ssl", verify_ssl)
-            set_setting("connection_config.use_v2_api", use_v2_api)
-            set_setting("export.attachments_export", attachments_export)
+        _global_cme_config().parent.mkdir(parents=True, exist_ok=True)
+        set_setting_with_keys(["auth", "confluence", base_url, "username"], username)
+        if pat:
+            set_setting_with_keys(["auth", "confluence", base_url, "pat"], pat)
+        if api_token:
+            set_setting_with_keys(["auth", "confluence", base_url, "api_token"], api_token)
+        set_setting("connection_config.verify_ssl", verify_ssl)
+        set_setting("connection_config.use_v2_api", use_v2_api)
+        set_setting("export.attachments_export", attachments_export)
         fields = [f for f in ("username", "pat", "api_token") if args.get(f)]
         return [TextContent(type="text", text=(
             f"OK: CME configured\n"
-            f"workspace: {workspace}\n"
             f"instance: {base_url}\n"
             f"credentials: {', '.join(fields)}\n"
             f"verify_ssl: {verify_ssl}\n"
             f"use_v2_api: {use_v2_api}\n"
             f"attachments_export: {attachments_export}\n"
-            f"config_path: {_workspace_cme_config(workspace)}\n"
-            f"Config persisted for this workspace — no reconfiguration needed on restart."
+            f"config_path: {_global_cme_config()}\n"
+            f"Credentials and connection settings are agent-wide (shared across all workspaces); "
+            f"export sources stay per-workspace. No reconfiguration needed on restart."
         ))]
     except (ValueError, KeyError, TypeError) as e:
         return [TextContent(type="text", text=f"Error: {e}")]
@@ -1357,12 +1516,12 @@ async def _tool_setup(args: dict) -> list[TextContent]:
 async def _tool_sources_list(args: dict) -> list[TextContent]:
     workspace = _workspace_name(str(args.get("workspace", "")).strip())
     manifest = _load_manifest(workspace)
-    with _cme_workspace_context(workspace):
-        lock = _lock_summary()
+    lock = _lock_summary(_workspace_untracked(workspace))
     result = {
         "workspace": workspace,
         "manifest_path": str(_workspace_manifest(workspace)),
-        "config_path": str(_workspace_cme_config(workspace)),
+        "config_path": str(_global_cme_config()),
+        "credentials_scope": "agent-wide (shared across all workspaces)",
         "sources": manifest.get("exports", []),
         "lock": lock,
     }
@@ -1447,7 +1606,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     workspace = str(args.get("workspace", "")).strip()
     workspace_path = _validate_workspace(workspace)
     workspace_data_dir = _workspace_data_dir(workspace)
-    cme_config_path = _workspace_cme_config(workspace)
+    cme_config_path = _global_cme_config()
     output_path = workspace_path / "raw" / "untracked"
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -1474,6 +1633,24 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         sources = exports
     if not sources:
         return [TextContent(type="text", text="Error: no sources defined. Use cme_source_add first.")]
+
+    # Preflight: every selected source must resolve to a configured Confluence
+    # instance in the shared config. Refuse here, naming each missing instance,
+    # instead of letting the exporter die mid-run with a bare auth error.
+    instances = _confluence_instances(get_settings())
+    unconfigured = []
+    for source in sources:
+        with contextlib.suppress(KeyError, TypeError):
+            source_url = _source_url(source)
+            if match_confluence_instance(instances, source_url) is None:
+                unconfigured.append(f"{source.get('name')} ({source_url})")
+    if unconfigured:
+        return [TextContent(type="text", text=(
+            "Error: no stored Confluence credentials for:\n"
+            + "\n".join(f"  - {item}" for item in unconfigured)
+            + "\nCredentials are agent-wide: call cme_setup(base_url=..., username=..., pat=...) "
+            "once for each missing instance (shared across all workspaces)."
+        ))]
 
     space_urls = [
         url
@@ -1506,7 +1683,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     async def _run_cmd(cmd: list[str]) -> int:
         env = {
             **os.environ,
-            "CME_CONFIG_PATH": str(cme_config_path),
+            "CME_CONFIG_PATH": str(_global_cme_config()),
             "CME_EXPORT__OUTPUT_PATH": str(output_path),
         }
         proc = await asyncio.create_subprocess_exec(
@@ -1637,9 +1814,8 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
     workspace = str(args.get("workspace", "") or "").strip()
     output_path = None
     if workspace:
-        output_path = _validate_workspace(workspace) / "raw" / "untracked"
-        with _cme_workspace_context(workspace):
-            lock = _lock_summary(output_path)
+        output_path = _workspace_untracked(workspace)
+        lock = _lock_summary(output_path)
     else:
         lock = {
             "status": "workspace_required",
@@ -1653,6 +1829,8 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    for notice in _migrate_legacy_workspace_configs():
+        print(f"[cme-mcp] migration: {notice}")
     streamable_http = StreamableHTTPSessionManager(
         app=app,
         event_store=None,

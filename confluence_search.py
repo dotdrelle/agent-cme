@@ -29,7 +29,8 @@ class ConfluenceSearchError(Exception):
 
 
 _ERROR_MESSAGES = {
-    "not_configured": "not_configured: no Confluence instance for this workspace. Call cme_setup first.",
+    "not_configured": "not_configured: no Confluence instance configured for the agent. Call cme_setup first.",
+    "instance_not_configured": "instance_not_configured: no stored credentials for the Confluence instance the workspace's sources point at. Call cme_setup for that instance.",
     "no_query": "no_query: provide either a free-text query or an explicit CQL expression.",
     "auth_failed": "auth_failed: Confluence rejected the stored credentials (HTTP 401/403).",
     "unreachable": "unreachable: the Confluence instance did not answer the search request.",
@@ -44,6 +45,40 @@ def _stored_instances(settings: Any) -> list[tuple[str, dict[str, Any]]]:
         for url, creds in confluence.items()
         if isinstance(creds, dict) and (creds.get("pat") or creds.get("api_token"))
     ]
+
+
+def match_confluence_instance(
+    instances: dict[str, dict[str, Any]], url: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Return (key, creds) for the instance matching *url*, else None.
+
+    Mirrors CME's own AuthConfig.get_instance resolution — exact URL key, then
+    host/port match with the context-path prefix rule — so search and the
+    export preflight agree with what the exporter will actually use.
+    """
+    target = str(url or "").rstrip("/")
+    if not target:
+        return None
+    creds = instances.get(target)
+    if isinstance(creds, dict):
+        return target, creds
+    parsed = urllib.parse.urlparse(target)
+    host = parsed.hostname or target
+    if host == "api.atlassian.com":  # gateway URL: exact match only
+        return None
+    for key, candidate in instances.items():
+        key_parsed = urllib.parse.urlparse(str(key))
+        if key_parsed.hostname == "api.atlassian.com":
+            continue
+        if key_parsed.hostname != host or key_parsed.port != parsed.port:
+            continue
+        # Key stored without a context path matches any context path on the
+        # same host; with one, it must prefix the lookup URL's path.
+        if not key_parsed.path.strip("/"):
+            return key, candidate
+        if parsed.path.startswith(key_parsed.path):
+            return key, candidate
+    return None
 
 
 def _connection_flags(settings: Any) -> tuple[bool, bool]:
@@ -106,8 +141,14 @@ def search_confluence(
     cql: str | None = None,
     limit: int = 10,
     space_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
-    """One live search. Raises ConfluenceSearchError on any failure family."""
+    """One live search. Raises ConfluenceSearchError on any failure family.
+
+    `base_url` pins the instance to search; when omitted, the single configured
+    instance is used, or the first one if several are configured. The chosen
+    instance is returned as `instance` so the answer states who was asked.
+    """
     query_text = str(query or "").strip()
     cql_text = str(cql or "").strip()
     if not cql_text and not query_text:
@@ -115,9 +156,15 @@ def search_confluence(
     instances = _stored_instances(settings)
     if not instances:
         raise ConfluenceSearchError("not_configured")
-    base_url, creds = instances[0]
+    if base_url:
+        match = match_confluence_instance(dict(instances), base_url)
+        if match is None:
+            raise ConfluenceSearchError("instance_not_configured")
+        instance_url, creds = match
+    else:
+        instance_url, creds = instances[0]
     verify_ssl, _use_v2 = _connection_flags(settings)
-    base = base_url.rstrip("/")
+    base = instance_url.rstrip("/")
 
     expression = cql_text if cql_text else f'text ~ "{_escape_cql(query_text)}"'
     space = _space_key(space_key)
@@ -157,6 +204,7 @@ def search_confluence(
         )
     return {
         "ok": True,
+        "instance": instance_url,
         "query": query_text or None,
         "cql": expression,
         "total": int(payload.get("totalSize", len(results))),

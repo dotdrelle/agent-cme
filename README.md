@@ -5,10 +5,12 @@
 MCP server that exposes [confluence-markdown-exporter](https://github.com/trentm/confluence-markdown-exporter) (CME) as a set of AI-agent tools. An orchestrating agent can configure CME per workspace, manage export sources, and trigger asynchronous Confluence exports over MCP Streamable HTTP.
 
 `agent-cme` is the exporter only. One global instance serves all workspaces:
-credentials, source manifests, and exports are isolated per workspace. When
-managed by `llm-wiki-manager`, the active workspace is injected automatically
-on every tool call — orchestrators never pass `workspace` explicitly. Each
-workspace's export output lands directly in its `raw/untracked/` directory.
+credentials and connection settings are agent-wide (shared across all
+workspaces — they belong to the operator's Confluence account), while source
+manifests, export output and export locks stay per workspace. When managed by
+`llm-wiki-manager`, the active workspace is injected automatically on every
+tool call — orchestrators never pass `workspace` explicitly. Each workspace's
+export output lands directly in its `raw/untracked/` directory.
 
 It belongs to a three-repository toolchain:
 
@@ -30,15 +32,20 @@ Orchestrating agent (Claude or other)
         ▼
   agent-cme MCP server  (port 3000)
         │
-        ├── /data/<workspace>/cme/app_data.json      ← CME credentials + connection settings
-        ├── /data/<workspace>/sources-manifest.yaml  ← export sources managed by agent
-        └── /workspaces/<workspace>/raw/untracked/   ← exported Markdown output
+        ├── /data/app_data.json                     ← CME credentials + connection settings (agent-wide)
+        ├── /data/<workspace>/sources-manifest.yaml ← export sources, per workspace
+        └── /workspaces/<workspace>/raw/untracked/  ← exported Markdown output
 ```
 
 All runtime state lives in `./data/` on the host, mounted as a Docker volume.
 No export source is versioned in Git. On first use for a workspace, agent-cme
 creates `./data/<workspace>/sources-manifest.yaml` if it does not already exist.
 MCP edits are persisted there and are not overwritten on later restarts.
+On startup, legacy per-workspace configs (`./data/<workspace>/cme/app_data.json`
+from the pre-shared layout) are merged into the agent-wide config — each
+instance keyed by its `base_url` — and renamed to `app_data.json.migrated`.
+Merged credentials never destroy an existing entry: a conflicting instance is
+kept as-is and the conflict is announced in the server log.
 
 ---
 
@@ -85,11 +92,12 @@ interpolation so the token is never hard-coded:
 }
 ```
 
-Credentials and source manifests are stored per workspace under
-`.agents-data/cme/<workspace>/`. For example:
+Credentials are stored agent-wide in `.agents-data/cme/app_data.json`
+(one config shared by every workspace, keyed by Confluence base URL). Source
+manifests stay per workspace:
 
 ```txt
-.agents-data/cme/my-project/cme/app_data.json
+.agents-data/cme/app_data.json                  ← shared credentials + connection settings
 .agents-data/cme/my-project/sources-manifest.yaml
 ```
 
@@ -101,14 +109,14 @@ Each `cme_export_run()` for the active workspace writes Markdown directly to
 Configure CME directly from the command line without going through an MCP agent:
 
 ```bash
-# configure credentials interactively
-CME_WORKSPACE=my-project docker compose run --rm cme-cli config
+# configure credentials interactively (agent-wide config)
+docker compose run --rm cme-cli config
 
 # run an export manually
-CME_WORKSPACE=my-project docker compose run --rm cme-cli export
+docker compose run --rm cme-cli export
 ```
 
-The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. Set `CME_WORKSPACE` so credentials are written under `./data/<workspace>/cme/app_data.json`; they are immediately visible to the MCP server for that workspace.
+The `cme-cli` service uses the `cme` binary from `confluence-markdown-exporter` and mounts the same `./data` volume as `cme-mcp`. It writes to the shared `/data/app_data.json`, immediately visible to the MCP server for every workspace.
 
 Register the running endpoint in `llm-wiki-manager/mcp.endpoints.json` as
 `cme`; the manager and served chat UI load it as an external MCP endpoint.
@@ -117,8 +125,9 @@ Register the running endpoint in `llm-wiki-manager/mcp.endpoints.json` as
 
 ## First-run agent workflow
 
-On first start, CME has no credentials. The agent must call `cme_setup` once.
-After that, the server is fully autonomous across restarts.
+On first start, CME has no credentials. The agent must call `cme_setup` once
+per Confluence instance (the config is agent-wide, so every workspace sees the
+result). After that, the server is fully autonomous across restarts.
 
 `cme_setup` is synchronous: it writes configuration and returns immediately. It
 does not create `_activity` metadata and will not appear in an Activity panel.
@@ -131,7 +140,7 @@ the active `/use <workspace>` is set once and applies to every call below:
 
 ```
 1. cme_status          → "not_configured — call cme_setup"
-2. cme_setup(...)      → credentials + settings written for active workspace
+2. cme_setup(...)      → agent-wide credentials + settings (once per Confluence instance)
 3. cme_sources_list()  → inspect runtime sources for active workspace
 4. cme_source_add(...) → add/update sources if needed
 5. cme_export_run()    → async export started, returns JSON with `job_id` and `_activity`
@@ -139,11 +148,13 @@ the active `/use <workspace>` is set once and applies to every call below:
 7. cme_export_cancel(job_id=...) → cancel a running export when needed
 ```
 
-**Direct MCP / standalone** — pass `workspace` explicitly on every call:
+**Direct MCP / standalone** — pass `workspace` explicitly on every call that
+scopes a workspace (`cme_setup` and `cme_test_connection` accept it but ignore
+it: credentials are agent-wide):
 
 ```
 1. cme_status(workspace="my-project")
-2. cme_setup(workspace="my-project", ...)
+2. cme_setup(base_url="https://confluence.example.com", username=..., pat=...)
 3. cme_sources_list(workspace="my-project")
 4. cme_source_add(workspace="my-project", ...)
 5. cme_export_run(workspace="my-project")
@@ -159,9 +170,9 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 
 | Tool                | Description                                                                              |
 | ------------------- | ---------------------------------------------------------------------------------------- |
-| `cme_status`        | Check if CME is configured for one workspace. Always call this first.                    |
-| `cme_setup`         | Workspace initialization: credentials + connection settings.                             |
-| `cme_test_connection` | Live authenticated probe of the configured Confluence instance (real request, no export). |
+| `cme_status`        | Check if CME is configured (agent-wide credentials). Always call this first.             |
+| `cme_setup`         | Agent-wide initialization: credentials + connection settings, keyed by Confluence base URL. |
+| `cme_test_connection` | Live authenticated probe of every configured Confluence instance (real request, no export). |
 | `cme_confluence_search` | Live read-only Confluence search (free-text or CQL), using the stored credentials.    |
 | `cme_wiki_search`   | Live read-only search over the workspace `wiki/**/*.md` pages (title + excerpt).         |
 | `cme_sources_list`  | List configured export sources for one workspace.                                       |
@@ -176,10 +187,12 @@ On subsequent restarts: `cme_status` returns `configured` and the agent skips st
 The two `*_search` tools are separate components inside the same agent
 (`confluence_search.py` and `wiki_search.py`), both read-only:
 
-- `cme_confluence_search` runs one bounded CQL request against the configured
-  instance with the workspace's stored credentials (`text ~ "query"` is built
-  from a free-text query; pass `cql` for a full expression, `space_key` to
-  restrict it). Returns pages with title, type, space, URL and a short
+- `cme_confluence_search` runs one bounded CQL request against the instance
+  the workspace's sources point at (falling back to the agent's configured
+  instance when the workspace declares none), using the shared credentials
+  (`text ~ "query"` is built from a free-text query; pass `cql` for a full
+  expression, `space_key` to restrict it). The reply names the `instance`
+  that was searched. Returns pages with title, type, space, URL and a short
   excerpt. Use it to explore Confluence directly before deciding what to
   export.
 - `cme_wiki_search` walks `workspaces/<workspace>/wiki/` on disk and matches
@@ -233,18 +246,21 @@ CME-specific response details:
 
 | Parameter    | Type    | Required | Description                                                    |
 | ------------ | ------- | -------- | -------------------------------------------------------------- |
-| `workspace`  | string  | yes      | Workspace name; config is stored under `/data/<workspace>/cme/` |
+| `workspace`  | string  | no       | Accepted for compatibility, ignored — credentials are agent-wide |
 | `base_url`   | string  | yes      | Confluence base URL, e.g. `http://confluence.example.com`      |
 | `username`   | string  | yes      | Confluence email address or login                              |
 | `pat`        | string  | no       | Personal Access Token (self-hosted)                            |
 | `api_token`  | string  | no       | API token (Atlassian Cloud)                                    |
 | `verify_ssl` | boolean | no       | Verify SSL certificates (default: `true`)                      |
 | `use_v2_api` | boolean | no       | Use REST API v2 — Data Center 8+ or Cloud (default: `false`)   |
+| `attachments_export` | string | no   | `referenced`, `all`, or `disabled` (default: `disabled`) — agent-wide |
 
 Always provide `username` as the Confluence email/login. Provide either `pat`
 for self-hosted Confluence, or `api_token` for Atlassian Cloud. `base_url` and
 `username` alone store connection settings but do not make `cme_status` return
-`configured`.
+`configured`. Credentials are stored keyed by `base_url` in the agent-wide
+config: call `cme_setup` once per distinct Confluence instance, and every
+workspace sharing that instance uses the same credentials.
 
 ### `cme_source_add`
 
@@ -389,9 +405,10 @@ python3 -m venv .cme
 # CME_DATA_DIR defaults to agent-cme/
 ```
 
-CME credentials are read from a workspace-specific `CME_CONFIG_PATH` during MCP
-tool calls. If you run the underlying `cme` binary manually without setting it,
-the binary falls back to its default OS path:
+CME credentials are read from the agent-wide `CME_CONFIG_PATH`
+(`CME_DATA_DIR/app_data.json`) during MCP tool calls. If you run the
+underlying `cme` binary manually without setting it, the binary falls back to
+its default OS path:
 
 - macOS: `~/Library/Application Support/confluence-markdown-exporter/app_data.json`
 - Linux: `~/.config/confluence-markdown-exporter/app_data.json`
@@ -401,14 +418,17 @@ the binary falls back to its default OS path:
 ## Data directory layout
 
 ```
-agent-cme/data/               ← mounted at /data in the container
-└── my-project/
-    ├── cme/
-    │   └── app_data.json        ← CME credentials + settings
-    └── sources-manifest.yaml    ← runtime export sources
+agent-cme/data/                ← mounted at /data in the container
+├── app_data.json                ← CME credentials + connection settings (agent-wide, keyed by base URL)
+├── <workspace>/
+│   └── sources-manifest.yaml    ← runtime export sources (per workspace)
+└── jobs/
+    └── idempotency.json         ← export job idempotency store (agent-wide)
 ```
 
-`data/` is gitignored — it contains credentials and generated content.
+`data/` is gitignored — it contains credentials and generated content. Export
+output and the export lock live in each workspace's `raw/untracked/` directory,
+never under `data/`.
 
 ## Relationship With llm-wiki
 
