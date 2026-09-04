@@ -74,7 +74,7 @@ def _global_cme_config() -> Path:
 # per-workspace context manager switched APP_CONFIG_PATH around every call.
 os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
 app_data_store.APP_CONFIG_PATH = _global_cme_config()
-_AGENT_VERSION = "0.15.77"
+_AGENT_VERSION = "0.15.78"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
