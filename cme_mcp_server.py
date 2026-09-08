@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -74,7 +75,7 @@ def _global_cme_config() -> Path:
 # per-workspace context manager switched APP_CONFIG_PATH around every call.
 os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
 app_data_store.APP_CONFIG_PATH = _global_cme_config()
-_AGENT_VERSION = "0.15.84"
+_AGENT_VERSION = "0.15.85"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -334,6 +335,116 @@ def _workspace_untracked(workspace: str) -> Path:
     return _validate_workspace(workspace) / "raw" / "untracked"
 
 
+def _workspace_export_mirror(workspace: str) -> Path:
+    """The persistent CME export output directory.
+
+    CME's skip-unchanged check re-exports a page whenever its exported file is
+    missing from the output directory. The workspace inbox (raw/untracked) is
+    emptied by every ingest, so exporting straight into it made every sync a
+    full re-export of identical content. The mirror keeps the exported files
+    and the export lockfile across ingests; only files that actually changed
+    are delivered to the inbox afterwards.
+    """
+    path = _workspace_data_dir(workspace) / "export"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _delivery_manifest_path(workspace: str) -> Path:
+    return _workspace_data_dir(workspace) / "delivery-manifest.json"
+
+
+def _read_delivery_manifest(workspace: str) -> dict[str, dict[str, int]]:
+    path = _delivery_manifest_path(workspace)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_delivery_manifest(workspace: str, entries: dict[str, dict[str, int]]) -> None:
+    _delivery_manifest_path(workspace).write_text(
+        json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> list[str]:
+    """Copy mirror files whose content changed since the last delivery.
+
+    The manifest stamps each delivered file with mtime_ns + size. A mirror file
+    whose stamp is unchanged was already delivered, so a sync with no
+    Confluence change delivers nothing and the downstream ingest sees an empty
+    inbox instead of re-processing the whole export. Files that disappeared
+    from the mirror (deleted upstream) are dropped from the manifest.
+    """
+    lockfile_name = "export.lock.json"
+    try:
+        lockfile_name = str(get_settings().export.lockfile_name or lockfile_name)
+    except Exception:
+        pass
+    manifest = _read_delivery_manifest(workspace)
+    delivered: list[str] = []
+    seen: set[str] = set()
+    if mirror.is_dir():
+        for file in sorted(mirror.rglob("*")):
+            if not file.is_file():
+                continue
+            relative = file.relative_to(mirror).as_posix()
+            if relative == lockfile_name:
+                continue
+            seen.add(relative)
+            try:
+                stamp = {"mtime_ns": file.stat().st_mtime_ns, "size": file.stat().st_size}
+            except OSError:
+                continue
+            if manifest.get(relative) == stamp:
+                continue
+            destination = inbox / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, destination)
+            manifest[relative] = stamp
+            delivered.append(relative)
+    for key in [key for key in manifest if key not in seen]:
+        del manifest[key]
+    _write_delivery_manifest(workspace, manifest)
+    return delivered
+
+
+def _pending_deliveries(workspace: str, inbox: Path) -> list[str]:
+    """Files this agent delivered that are still waiting in the inbox.
+
+    Ingest archives what it consumes, so a manifest entry whose copy is still
+    in `raw/untracked/` was delivered and never processed. Without this, a sync
+    that legitimately delivers nothing reports "already up to date" while the
+    inbox holds a previous batch nobody ingested — and the skill body then tells
+    the user precisely not to launch an ingest.
+    """
+    manifest = _read_delivery_manifest(workspace)
+    return [relative for relative in manifest if (inbox / relative).is_file()]
+
+
+def _parse_export_counts(stdout_lines: list[str]) -> tuple[int | None, int | None]:
+    """(exported, unchanged) page counts from the exporter's stdout."""
+    # `or None` collapsed a real zero into "unknown": a sync where the exporter
+    # skipped every page and one where its log format changed and nothing could
+    # be parsed reported the same value. Zero is an answer; None means there was
+    # no output to read at all.
+    exported: int | None = sum(line.count("Exported '") for line in stdout_lines) if stdout_lines else None
+    unchanged: int | None = None
+    for line in stdout_lines:
+        for pattern in (
+            r"Skipping (\d+) unchanged page\(s\)",
+            r"All (\d+) page\(s\) unchanged",
+        ):
+            match = re.search(pattern, line)
+            if match:
+                unchanged = (unchanged or 0) + int(match.group(1))
+    return exported, unchanged
+
+
 def _confluence_instances(settings: Any) -> dict[str, dict[str, Any]]:
     """The URL-keyed Confluence credentials dict from the shared config."""
     data = json.loads(settings.model_dump_json())
@@ -485,13 +596,22 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "running")
     sources = job.get("sources") or []
     workspace = job.get("workspace")
-    label = f"CME export · {status}"
+    unchanged_announcement = (
+        status == "success"
+        and job.get("changed") is False
+        and "delivered" in job
+    )
+    if unchanged_announcement:
+        label = "CME export · no changes"
+    else:
+        label = f"CME export · {status}"
     if workspace:
         label = f"{label} · {workspace}"
     if sources:
         label = f"{label} · {', '.join(str(source) for source in sources[:3])}"
         if len(sources) > 3:
             label = f"{label} +{len(sources) - 3}"
+    delivered = job.get("delivered")
     return {
         "id": job_id,
         "source": "cme",
@@ -503,6 +623,12 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
             "stdoutLines": len(job.get("stdout") or []),
             "stderrLines": len(job.get("stderr") or []),
         },
+        **({
+            "exported": job.get("exported"),
+            "unchanged": job.get("unchanged"),
+            "delivered": len(delivered) if isinstance(delivered, list) else delivered,
+            "changed": job.get("changed"),
+        } if "delivered" in job else {}),
         "poll": {
             "server": "cme",
             "tool": "cme_export_status",
@@ -1030,25 +1156,27 @@ async def list_tools() -> list[Tool]:
                 "(cme_source_add). Use this only to configure the live agent-cme Confluence exporter, not to edit "
                 "llm-wiki markdown pages. After setup the server is autonomous — no reconfiguration needed on restart. "
                 "Always provide username as the Confluence email/login. "
-                "Provide pat (self-hosted PAT) or api_token (Atlassian Cloud)."
+                "Provide pat (self-hosted PAT) or api_token (Atlassian Cloud). "
+                "Call this only when cme_status reports not_configured, or when the user explicitly provides credentials "
+                "to update; never call it without base_url."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "workspace": {"type": "string", "description": "Optional workspace name (accepted for compatibility, ignored — credentials are agent-wide)."},
-                    "base_url": {"type": "string", "description": "Confluence base URL, e.g. http://confluence.example.com"},
-                    "username": {"type": "string", "description": "Confluence email address or login"},
-                    "pat": {"type": "string", "description": "Personal Access Token (self-hosted)"},
-                    "api_token": {"type": "string", "description": "API token (Atlassian Cloud)"},
-                    "verify_ssl": {"type": "boolean", "description": "Verify SSL certificates (default: true)"},
-                    "use_v2_api": {"type": "boolean", "description": "Use Confluence REST API v2 — for Data Center 8+ or Cloud (default: false)"},
+                    "base_url": {"type": ["string", "null"], "description": "Confluence base URL, e.g. http://confluence.example.com"},
+                    "username": {"type": ["string", "null"], "description": "Confluence email address or login"},
+                    "pat": {"type": ["string", "null"], "description": "Personal Access Token (self-hosted)"},
+                    "api_token": {"type": ["string", "null"], "description": "API token (Atlassian Cloud)"},
+                    "verify_ssl": {"type": ["boolean", "null"], "description": "Verify SSL certificates (default: true)"},
+                    "use_v2_api": {"type": ["boolean", "null"], "description": "Use Confluence REST API v2 — for Data Center 8+ or Cloud (default: false)"},
                     "attachments_export": {
                         "type": "string",
                         "enum": ["referenced", "all", "disabled"],
                         "description": "Which page attachments to download during export (default: disabled). Agent-wide.",
                     },
                 },
-                "required": ["base_url", "username"],
+                "required": [],
             },
         ),
         Tool(
@@ -1116,6 +1244,9 @@ async def list_tools() -> list[Tool]:
                 "To ingest exported files into the wiki, run production_start_job(type=\"ingest\") separately. "
                 "Use cme_export_cancel(job_id=...) to request cancellation of a running export; files already written before cancellation are left in place. "
                 "If the export fails during the initial Confluence preflight request, such as /rest/api/space?limit=1, no markdown export files have been written yet. "
+                "Unchanged Confluence pages are skipped and only changed files are staged in raw/untracked: when the job finishes with "
+                "changed=false (delivered=0), nothing changed since the last export — report that as a normal, up-to-date outcome, "
+                "never as content that was refreshed. "
                 "Returns a job_id immediately. Use cme_export_status(job_id=...) to follow progress."
             ),
             inputSchema={
@@ -1151,8 +1282,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string", "description": "Job ID returned by cme_export_run. If omitted, returns lock summary."},
-                    "workspace": {"type": "string", "description": "Optional workspace name for lock summary when job_id is omitted."},
+                    "job_id": {"type": ["string", "null"], "description": "Job ID returned by cme_export_run. If omitted or null, returns lock summary."},
+                    "workspace": {"type": ["string", "null"], "description": "Optional workspace name for lock summary when job_id is omitted."},
                 },
                 "required": [],
             },
@@ -1354,7 +1485,7 @@ async def _tool_status(args: dict) -> list[TextContent]:
         lines.append(f"use_v2_api: {conn.get('use_v2_api', False)}")
         lines.append(f"attachments_export: {data.get('export', {}).get('attachments_export', 'disabled')}")
         if workspace_path:
-            lock = _lock_summary(workspace_path / "raw" / "untracked")
+            lock = _lock_summary(_workspace_export_mirror(workspace))
             if lock.get("last_export"):
                 lines.append(f"last_export: {lock['last_export']}")
     else:
@@ -1473,15 +1604,31 @@ async def _tool_wiki_search(args: dict) -> list[TextContent]:
 
 
 async def _tool_setup(args: dict) -> list[TextContent]:
-    base_url: str = args["base_url"].rstrip("/")
-    username: str = str(args.get("username", "")).strip()
-    pat: str = args.get("pat", "")
-    api_token: str = args.get("api_token", "")
-    verify_ssl: bool = args.get("verify_ssl", True)
-    use_v2_api: bool = args.get("use_v2_api", False)
-    attachments_export: str = args.get("attachments_export", "disabled")
+    # `required` was relaxed to [] so a model passing an explicit null does not
+    # get a schema error — which means every field here must treat a present
+    # null exactly like an absent key. `.get(key, default)` does NOT: the key IS
+    # present, so it returns None, and `str(None)` is the truthy string "None".
+    # That sailed past the `if not username` guard and persisted "None" as an
+    # agent-wide credential, shared by every workspace on that Confluence
+    # instance, failing auth on every later export.
+    base_url = str(args.get("base_url") or "").strip().rstrip("/")
+    username: str = str(args.get("username") or "").strip()
+    pat: str = args.get("pat") or ""
+    api_token: str = args.get("api_token") or ""
+    # Booleans cannot use `or`: an explicit False would be replaced by the
+    # default. Only a genuine None falls back.
+    verify_ssl_arg = args.get("verify_ssl")
+    verify_ssl: bool = True if verify_ssl_arg is None else verify_ssl_arg
+    use_v2_api_arg = args.get("use_v2_api")
+    use_v2_api: bool = False if use_v2_api_arg is None else use_v2_api_arg
+    attachments_export: str = args.get("attachments_export") or "disabled"
     workspace = str(args.get("workspace") or "").strip()
     try:
+        if not base_url:
+            return [TextContent(type="text", text=(
+                "Error: base_url is required. Call cme_setup only when cme_status reports "
+                "not_configured or when the user provides new credentials, and pass the "
+                "Confluence base_url plus username and pat (self-hosted) or api_token (Cloud)."))]
         if workspace:
             _workspace_name(workspace)
         if not username:
@@ -1516,7 +1663,7 @@ async def _tool_setup(args: dict) -> list[TextContent]:
 async def _tool_sources_list(args: dict) -> list[TextContent]:
     workspace = _workspace_name(str(args.get("workspace", "")).strip())
     manifest = _load_manifest(workspace)
-    lock = _lock_summary(_workspace_untracked(workspace))
+    lock = _lock_summary(_workspace_export_mirror(workspace))
     result = {
         "workspace": workspace,
         "manifest_path": str(_workspace_manifest(workspace)),
@@ -1609,6 +1756,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
     cme_config_path = _global_cme_config()
     output_path = workspace_path / "raw" / "untracked"
     output_path.mkdir(parents=True, exist_ok=True)
+    mirror_path = _workspace_export_mirror(workspace)
 
     manifest = _load_manifest(workspace)
     exports: list = manifest.get("exports", [])
@@ -1671,6 +1819,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "workspace_path": str(workspace_path),
         "config_path": str(cme_config_path),
         "output_path": str(output_path),
+        "mirror_path": str(mirror_path),
         "sources": [s["name"] for s in sources],
         "started_at": _now(),
         "stdout": [],
@@ -1684,7 +1833,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         env = {
             **os.environ,
             "CME_CONFIG_PATH": str(_global_cme_config()),
-            "CME_EXPORT__OUTPUT_PATH": str(output_path),
+            "CME_EXPORT__OUTPUT_PATH": str(mirror_path),
         }
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1731,6 +1880,25 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
             if page_descendant_urls and rc == 0:
                 rc = await _run_cmd([_CME_BIN, "pages-with-descendants", *page_descendant_urls])
             _jobs[job_id]["returncode"] = rc
+            if rc == 0:
+                delivered = _deliver_changed_files(workspace, mirror_path, output_path)
+                exported, unchanged = _parse_export_counts(list(_jobs[job_id].get("stdout") or []))
+                _jobs[job_id]["delivered"] = delivered
+                _jobs[job_id]["exported"] = exported
+                _jobs[job_id]["unchanged"] = unchanged
+                # "Changed" is decided by what was delivered, never by the
+                # exporter's own counters: a page the exporter rewrote still
+                # counts as changed, but a page it skipped does not.
+                #
+                # A previous batch still waiting in the inbox also counts. It
+                # was delivered and never ingested, so there IS pending work —
+                # and reporting "already up to date" there strands it: the
+                # manifest only forgets files deleted upstream, so nothing would
+                # ever re-deliver them and the user would have to delete the
+                # manifest by hand to recover.
+                pending = _pending_deliveries(workspace, output_path)
+                _jobs[job_id]["pending_in_inbox"] = len(pending)
+                _jobs[job_id]["changed"] = bool(delivered) or bool(pending)
             _jobs[job_id]["status"] = "success" if rc == 0 else "failed"
             _jobs[job_id]["finished_at"] = _now()
         except asyncio.CancelledError:
@@ -1751,7 +1919,11 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
         "workspacePath": str(workspace_path),
         "outputPath": str(output_path),
         "sources": [s["name"] for s in sources],
-        "message": f"Export started. Use cme_export_status(job_id='{job_id}') to follow progress.",
+        "message": (
+            f"Export started. Use cme_export_status(job_id='{job_id}') to follow progress. "
+            "Unchanged Confluence pages are skipped: a job that delivers no file means "
+            "nothing changed since the last export."
+        ),
         "_activity": _activity_for_job(job_id, _jobs[job_id]),
     })]
 
@@ -1793,6 +1965,7 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown job_id: {job_id}")]
         stdout = job.get("stdout", [])
         stderr = job.get("stderr", [])
+        delivered = job.get("delivered")
         return [_json_content({
             "ok": True,
             "job_id": job_id,
@@ -1802,11 +1975,19 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
             "configPath": job.get("config_path"),
             "workspacePath": job.get("workspace_path"),
             "outputPath": job.get("output_path"),
+            "mirrorPath": job.get("mirror_path"),
             "sources": job.get("sources", []),
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
             "returncode": job.get("returncode"),
             "error": job.get("error"),
+            **({
+                "exported": job.get("exported"),
+                "unchanged": job.get("unchanged"),
+                "delivered": len(delivered) if isinstance(delivered, list) else delivered,
+                "deliveredFiles": delivered[:20] if isinstance(delivered, list) else [],
+                "changed": job.get("changed"),
+            } if "delivered" in job else {}),
             "stdout_tail": stdout[-20:],
             "stderr_tail": stderr[-20:],
             "_activity": _activity_for_job(job_id, job),
@@ -1814,7 +1995,7 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
     workspace = str(args.get("workspace", "") or "").strip()
     output_path = None
     if workspace:
-        output_path = _workspace_untracked(workspace)
+        output_path = _workspace_export_mirror(workspace)
         lock = _lock_summary(output_path)
     else:
         lock = {

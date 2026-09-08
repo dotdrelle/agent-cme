@@ -161,6 +161,100 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertIn("auth=pat", status)
         self.assertNotIn("secret-pat", status)
 
+    def test_setup_without_base_url_answers_with_actionable_error_and_writes_nothing(self):
+        # LLM surfaces pass explicit nulls or call optional-parameter tools with
+        # no arguments; a JSON-schema rejection is a dead end for the model, a
+        # tool answer is something it can act on. Setup must answer, and must
+        # not persist a partial credential entry.
+        missing_base = asyncio.run(self.server._tool_setup({}))[0].text
+        self.assertIn("Error: base_url is required", missing_base)
+        self.assertIn("cme_status", missing_base)
+
+        missing_username = asyncio.run(self.server._tool_setup({
+            "base_url": "https://confluence.example",
+        }))[0].text
+        self.assertIn("Error: username is required", missing_username)
+
+        self.assertFalse((self.server._DATA_DIR / "app_data.json").exists())
+
+    def test_export_status_accepts_a_null_job_id(self):
+        # Polling with an explicit null job_id must degrade to the lock summary
+        # (or to the workspace_required hint) instead of a validation failure.
+        text = asyncio.run(self.server._tool_export_status({
+            "job_id": None, "workspace": "demo",
+        }))[0].text
+        self.assertIn("export.lock.json", text)
+
+        text = asyncio.run(self.server._tool_export_status({"job_id": None}))[0].text
+        self.assertIn("workspace_required", text)
+
+    def test_schemas_allow_null_for_optional_export_status_and_setup_arguments(self):
+        tools = {t.name: t.inputSchema for t in asyncio.run(self.server.list_tools())}
+        status_schema = tools["cme_export_status"]
+        self.assertEqual(status_schema["properties"]["job_id"]["type"], ["string", "null"])
+        self.assertEqual(status_schema["properties"]["workspace"]["type"], ["string", "null"])
+        setup_schema = tools["cme_setup"]
+        self.assertEqual(setup_schema["required"], [])
+
+    def test_delivery_copies_changed_mirror_files_and_skips_unchanged(self):
+        mirror = self.server._workspace_export_mirror("demo")
+        inbox = self.server._workspace_untracked("demo")
+        (mirror / "DEV").mkdir(parents=True)
+        (mirror / "export.lock.json").write_text("{}", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
+        (mirror / "DEV" / "Page B.md").write_text("# B", encoding="utf-8")
+
+        first = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(sorted(first), ["DEV/Page A.md", "DEV/Page B.md"])
+        self.assertTrue((inbox / "DEV" / "Page A.md").is_file())
+        self.assertFalse((inbox / "export.lock.json").exists())
+
+        # Same content again: nothing new is delivered — the downstream ingest
+        # sees an empty inbox instead of re-processing the whole export.
+        second = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(second, [])
+
+        # A changed page is re-delivered, and only that page.
+        (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        third = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(third, ["DEV/Page A.md"])
+
+        # A page deleted upstream leaves the manifest too, so a recreated page
+        # would be delivered again instead of being masked by a stale stamp.
+        (mirror / "DEV" / "Page B.md").unlink()
+        fourth = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(fourth, [])
+        manifest = self.server._read_delivery_manifest("demo")
+        self.assertIn("DEV/Page A.md", manifest)
+        self.assertNotIn("DEV/Page B.md", manifest)
+
+    def test_export_counts_are_parsed_from_stdout(self):
+        exported, unchanged = self.server._parse_export_counts([
+            "Exported 'Page A' -> /tmp/DEV/Page A.md",
+            "Exported 'Page B' -> /tmp/DEV/Page B.md",
+            "Skipping 12 unchanged page(s).",
+        ])
+        self.assertEqual(exported, 2)
+        self.assertEqual(unchanged, 12)
+
+        # Exporting nothing is an ANSWER, not an absence of one: this used to
+        # report None, indistinguishable from "the log format changed and no
+        # counter could be read".
+        exported, unchanged = self.server._parse_export_counts([
+            "All 42 page(s) unchanged — nothing to export.",
+        ])
+        self.assertEqual(exported, 0)
+        self.assertEqual(unchanged, 42)
+
+        exported, unchanged = self.server._parse_export_counts(["no counters here"])
+        self.assertEqual(exported, 0)
+        self.assertIsNone(unchanged)
+
+        # Only genuinely having nothing to read yields None.
+        exported, unchanged = self.server._parse_export_counts([])
+        self.assertIsNone(exported)
+        self.assertIsNone(unchanged)
+
     def test_test_connection_reports_not_configured_when_no_instance(self):
         text = asyncio.run(self.server._tool_test_connection({"workspace": "demo"}))[0].text
         self.assertIn("not_configured", text)

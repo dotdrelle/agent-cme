@@ -217,6 +217,25 @@ executor-only agent, `canPlan: false`):
 Configuring credentials or sources never triggers an export: exports run only
 as approved orchestrated tasks or explicit `cme_export_run` calls.
 
+### Change-aware exports
+
+Exports are change-aware: CME skips unchanged Confluence pages (its lockfile
+tracks each page's version), and the agent keeps the exporter's output in a
+persistent per-workspace mirror under the agent state directory instead of
+writing straight into `raw/untracked/`. After each export, only files that
+actually changed are delivered to the workspace inbox — a delivery manifest
+(`/data/<workspace>/delivery-manifest.json`) stamps every delivered file with
+mtime+size.
+
+Why the mirror: CME re-exports a page whenever its exported file is missing
+from the output directory, and llm-wiki's ingest archives (`raw/untracked/` →
+`raw/ingested/`) every staged file. Writing straight into the inbox meant the
+next sync found all files gone and re-exported the whole space, so the run was
+always green while nothing had changed. With the mirror, a sync with no
+Confluence change exports nothing new, delivers nothing, and the job reports
+`changed: false` (`delivered: 0`) — "no changes" is a normal, up-to-date
+outcome, announced as such instead of being reported as refreshed content.
+
 ### Activity metadata
 
 `cme_export_run` and `cme_export_status(job_id=...)` include additive

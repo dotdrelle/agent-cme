@@ -60,6 +60,15 @@ retry with a known `idempotencyKey` returns the existing job or result.
   activity.
 - Exports should be asynchronous and cancellable. Do not block the MCP request
   until a full Confluence export completes.
+- Exports are change-aware: CME skips unchanged pages via its export lockfile,
+  and the agent exports into a persistent per-workspace mirror under the agent
+  state directory (`/data/<workspace>/export/`), then delivers only changed
+  files to `raw/untracked/` using a delivery manifest. Do not point the
+  exporter's output path back at the inbox: ingest archives every staged file,
+  which makes CME's skip-unchanged check re-export everything on the next sync
+  and turns a no-change sync into a full green re-run. A job that delivers
+  nothing reports `changed: false` — "no changes" is a normal outcome and must
+  be announced as such, never as refreshed content.
 - `cme_export_run` and `cme_export_status(job_id=...)` should return JSON with
   additive `_activity` metadata so managers can poll progress through
   `cme.cme_export_status` without parsing CME-specific text.
