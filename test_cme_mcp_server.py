@@ -205,28 +205,65 @@ class CmeMcpServerTest(unittest.TestCase):
         (mirror / "DEV" / "Page B.md").write_text("# B", encoding="utf-8")
 
         first = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(sorted(first), ["DEV/Page A.md", "DEV/Page B.md"])
+        self.assertEqual(sorted(first["delivered"]), ["DEV/Page A.md", "DEV/Page B.md"])
+        self.assertEqual(first["modified"], [])
         self.assertTrue((inbox / "DEV" / "Page A.md").is_file())
         self.assertFalse((inbox / "export.lock.json").exists())
 
         # Same content again: nothing new is delivered — the downstream ingest
         # sees an empty inbox instead of re-processing the whole export.
         second = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(second, [])
+        self.assertEqual(second, {"delivered": [], "modified": []})
 
         # A changed page is re-delivered, and only that page.
         (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
         third = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(third, ["DEV/Page A.md"])
+        self.assertEqual(third, {"delivered": ["DEV/Page A.md"], "modified": []})
 
         # A page deleted upstream leaves the manifest too, so a recreated page
         # would be delivered again instead of being masked by a stale stamp.
         (mirror / "DEV" / "Page B.md").unlink()
         fourth = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(fourth, [])
+        self.assertEqual(fourth, {"delivered": [], "modified": []})
         manifest = self.server._read_delivery_manifest("demo")
         self.assertIn("DEV/Page A.md", manifest)
         self.assertNotIn("DEV/Page B.md", manifest)
+
+    def test_delivery_never_resurrects_or_overwrites_the_readers_inbox_copy(self):
+        # wiki-sync is the SOURCE's fetch path, not a git checkout: a deleted
+        # pending file stays deleted, and a locally modified one is flagged
+        # (orange, via .wiki/cme-sync.json) instead of being overwritten.
+        mirror = self.server._workspace_export_mirror("demo")
+        inbox = self.server._workspace_untracked("demo")
+        (mirror / "DEV").mkdir(parents=True)
+        (mirror / "export.lock.json").write_text("{}", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
+        self.server._deliver_changed_files("demo", mirror, inbox)
+
+        # Deleted: the sync leaves it alone — no resurrection.
+        (inbox / "DEV" / "Page A.md").unlink()
+        quiet = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(quiet, {"delivered": [], "modified": []})
+        self.assertFalse((inbox / "DEV" / "Page A.md").exists())
+        self.assertFalse(self.server._sync_marker_path("demo").exists())
+
+        # Re-delivered first (mirror changed), then edited locally.
+        (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        self.server._deliver_changed_files("demo", mirror, inbox)
+        (inbox / "DEV" / "Page A.md").write_text("# A edited by the reader", encoding="utf-8")
+
+        # Edited (even with an identical length): not overwritten, flagged.
+        flagged = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(flagged, {"delivered": [], "modified": ["DEV/Page A.md"]})
+        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), "# A edited by the reader")
+        marker = json.loads(self.server._sync_marker_path("demo").read_text(encoding="utf-8"))
+        self.assertEqual(marker["modifiedLocally"], ["DEV/Page A.md"])
+
+        # Unchanged copy: nothing to flag, and the marker clears.
+        (inbox / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        quiet = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(quiet, {"delivered": [], "modified": []})
+        self.assertFalse(self.server._sync_marker_path("demo").exists())
 
     def test_export_counts_are_parsed_from_stdout(self):
         exported, unchanged = self.server._parse_export_counts([

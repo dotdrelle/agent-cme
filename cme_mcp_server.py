@@ -4,6 +4,7 @@
 import asyncio
 import contextvars
 import contextlib
+import hashlib
 import hmac
 import json
 import os
@@ -75,7 +76,7 @@ def _global_cme_config() -> Path:
 # per-workspace context manager switched APP_CONFIG_PATH around every call.
 os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
 app_data_store.APP_CONFIG_PATH = _global_cme_config()
-_AGENT_VERSION = "0.15.85"
+_AGENT_VERSION = "0.15.86"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -371,7 +372,51 @@ def _write_delivery_manifest(workspace: str, entries: dict[str, dict[str, int]])
     )
 
 
-def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> list[str]:
+def _sync_marker_path(workspace: str) -> Path:
+    """Marker read by llm-wiki's Pending panel: which inbox files were edited
+    locally since delivery.
+
+    CME and the wiki engine share only the workspace filesystem, so the flag
+    travels as a small JSON in the workspace's internal state directory —
+    llm-wiki owns that directory, this file is CME's entry in it.
+    """
+    return _workspace_untracked(workspace).parent.parent / ".wiki" / "cme-sync.json"
+
+
+def _write_sync_marker(workspace: str, modified: list[str]) -> None:
+    try:
+        marker = _sync_marker_path(workspace)
+        if modified:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                json.dumps({"modifiedLocally": modified}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        elif marker.exists():
+            marker.unlink()
+    except Exception:
+        # The flag is an announcement, not the sync itself: a workspace that
+        # cannot receive the marker must still get its files.
+        pass
+
+
+def _same_file_content(a: Path, b: Path) -> bool:
+    """Byte-level equality; size first, then a real digest.
+
+    mtime+size alone is not enough to answer "did the reader edit this file":
+    an edit that preserves the length keeps the stamp identical. The digest is
+    computed per file, only when sizes match, so a large export costs one read
+    of the inbox copy, not two.
+    """
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        return hashlib.sha256(a.read_bytes()).digest() == hashlib.sha256(b.read_bytes()).digest()
+    except OSError:
+        return False
+
+
+def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[str, list[str]]:
     """Copy mirror files whose content changed since the last delivery.
 
     The manifest stamps each delivered file with mtime_ns + size. A mirror file
@@ -379,6 +424,18 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> list[st
     Confluence change delivers nothing and the downstream ingest sees an empty
     inbox instead of re-processing the whole export. Files that disappeared
     from the mirror (deleted upstream) are dropped from the manifest.
+
+    The inbox copy is the reader's own working area, and wiki-sync is the
+    SOURCE's fetch path, not a git checkout of the workspace:
+
+    - a pending file the reader DELETED stays deleted — the sync never
+      resurrects local work it did not make;
+    - a pending file the reader MODIFIED is not overwritten either: it is
+      reported in "modified" and flagged orange in the Pending panel through
+      .wiki/cme-sync.json, and keeping or deleting it is the reader's call.
+
+    Returns {"delivered": [...], "modified": [...]}: delivered is what the
+    exporter changed, modified is what the reader changed since delivery.
     """
     lockfile_name = "export.lock.json"
     try:
@@ -387,6 +444,7 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> list[st
         pass
     manifest = _read_delivery_manifest(workspace)
     delivered: list[str] = []
+    modified: list[str] = []
     seen: set[str] = set()
     if mirror.is_dir():
         for file in sorted(mirror.rglob("*")):
@@ -400,17 +458,22 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> list[st
                 stamp = {"mtime_ns": file.stat().st_mtime_ns, "size": file.stat().st_size}
             except OSError:
                 continue
+            inbox_copy = inbox / relative
             if manifest.get(relative) == stamp:
+                # Mirror unchanged since last delivery: nothing to fetch. A
+                # locally modified copy is announced, never overwritten.
+                if inbox_copy.is_file() and not _same_file_content(file, inbox_copy):
+                    modified.append(relative)
                 continue
-            destination = inbox / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file, destination)
+            inbox_copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, inbox_copy)
             manifest[relative] = stamp
             delivered.append(relative)
     for key in [key for key in manifest if key not in seen]:
         del manifest[key]
     _write_delivery_manifest(workspace, manifest)
-    return delivered
+    _write_sync_marker(workspace, modified)
+    return {"delivered": delivered, "modified": modified}
 
 
 def _pending_deliveries(workspace: str, inbox: Path) -> list[str]:
@@ -612,6 +675,7 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
         if len(sources) > 3:
             label = f"{label} +{len(sources) - 3}"
     delivered = job.get("delivered")
+    modified = job.get("modifiedLocally")
     return {
         "id": job_id,
         "source": "cme",
@@ -627,6 +691,7 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
             "exported": job.get("exported"),
             "unchanged": job.get("unchanged"),
             "delivered": len(delivered) if isinstance(delivered, list) else delivered,
+            "modifiedLocally": len(modified) if isinstance(modified, list) else modified,
             "changed": job.get("changed"),
         } if "delivered" in job else {}),
         "poll": {
@@ -1881,14 +1946,19 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 rc = await _run_cmd([_CME_BIN, "pages-with-descendants", *page_descendant_urls])
             _jobs[job_id]["returncode"] = rc
             if rc == 0:
-                delivered = _deliver_changed_files(workspace, mirror_path, output_path)
+                result = _deliver_changed_files(workspace, mirror_path, output_path)
+                delivered = result["delivered"]
+                modified = result["modified"]
                 exported, unchanged = _parse_export_counts(list(_jobs[job_id].get("stdout") or []))
                 _jobs[job_id]["delivered"] = delivered
+                _jobs[job_id]["modifiedLocally"] = modified
                 _jobs[job_id]["exported"] = exported
                 _jobs[job_id]["unchanged"] = unchanged
                 # "Changed" is decided by what was delivered, never by the
                 # exporter's own counters: a page the exporter rewrote still
-                # counts as changed, but a page it skipped does not.
+                # counts as changed, but a page it skipped does not. A locally
+                # modified pending file counts too — it waits on the reader's
+                # decision, not on the source.
                 #
                 # A previous batch still waiting in the inbox also counts. It
                 # was delivered and never ingested, so there IS pending work —
@@ -1898,7 +1968,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 # manifest by hand to recover.
                 pending = _pending_deliveries(workspace, output_path)
                 _jobs[job_id]["pending_in_inbox"] = len(pending)
-                _jobs[job_id]["changed"] = bool(delivered) or bool(pending)
+                _jobs[job_id]["changed"] = bool(delivered) or bool(modified) or bool(pending)
             _jobs[job_id]["status"] = "success" if rc == 0 else "failed"
             _jobs[job_id]["finished_at"] = _now()
         except asyncio.CancelledError:
@@ -1966,6 +2036,7 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
         stdout = job.get("stdout", [])
         stderr = job.get("stderr", [])
         delivered = job.get("delivered")
+        modified = job.get("modifiedLocally")
         return [_json_content({
             "ok": True,
             "job_id": job_id,
@@ -1986,6 +2057,8 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
                 "unchanged": job.get("unchanged"),
                 "delivered": len(delivered) if isinstance(delivered, list) else delivered,
                 "deliveredFiles": delivered[:20] if isinstance(delivered, list) else [],
+                "modifiedLocally": len(modified) if isinstance(modified, list) else modified,
+                "modifiedLocallyFiles": modified[:20] if isinstance(modified, list) else [],
                 "changed": job.get("changed"),
             } if "delivered" in job else {}),
             "stdout_tail": stdout[-20:],
