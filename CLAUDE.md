@@ -69,6 +69,15 @@ retry with a known `idempotencyKey` returns the existing job or result.
   and turns a no-change sync into a full green re-run. A job that delivers
   nothing reports `changed: false` — "no changes" is a normal outcome and must
   be announced as such, never as refreshed content.
+- The inbox copy is the reader's own working area, and wiki-sync is the
+  SOURCE's fetch path, not a git checkout: a deleted pending file stays
+  deleted (never resurrected), and a locally modified one is NOT overwritten —
+  it is reported as `modifiedLocally` and flagged orange in the workspace's
+  Pending panel through `.wiki/cme-sync.json` (`_write_sync_marker`; llm-wiki
+  reads it in `renderUntrackedSidebar`). The reader decides to keep or delete
+  it; the marker clears on the next sync once the copy matches the mirror
+  again. `_deliver_changed_files` returns `{ delivered, modified }` — both
+  count toward `changed`.
 - `cme_export_run` and `cme_export_status(job_id=...)` should return JSON with
   additive `_activity` metadata so managers can poll progress through
   `cme.cme_export_status` without parsing CME-specific text.

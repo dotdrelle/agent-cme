@@ -236,6 +236,18 @@ Confluence change exports nothing new, delivers nothing, and the job reports
 `changed: false` (`delivered: 0`) — "no changes" is a normal, up-to-date
 outcome, announced as such instead of being reported as refreshed content.
 
+The inbox copy is the reader's own working area, and wiki-sync is the
+SOURCE's fetch path, not a git checkout of the workspace:
+
+- a pending file the reader **deleted** stays deleted — the sync never
+  resurrects local work it did not make;
+- a pending file the reader **modified** is not overwritten either: it is
+  reported as `modifiedLocally` in the job payload and flagged **orange** in
+  the workspace's Pending panel through `.wiki/cme-sync.json` (written by this
+  agent, read by llm-wiki's served sidebar). Keeping or deleting the modified
+  copy is the reader's call — the flag clears on the next sync once the copy
+  no longer diverges from the delivered source.
+
 ### Activity metadata
 
 `cme_export_run` and `cme_export_status(job_id=...)` include additive
