@@ -196,6 +196,50 @@ class CmeMcpServerTest(unittest.TestCase):
         setup_schema = tools["cme_setup"]
         self.assertEqual(setup_schema["required"], [])
 
+    def test_strip_flattened_toc_headings_drops_the_macro_not_real_headings(self):
+        # Confluence's TOC macro exports as one heading line concatenating
+        # every entry as a same-page anchor link — llm-wiki already builds its
+        # own "On this page" panel from the real headings, so this line is a
+        # redundant, broken duplicate that must be dropped.
+        flattened_toc = (
+            "# Title\n\n"
+            "# - [](#p-) - [Foo](#p-foo) - [Bar](#p-bar) - [Baz](#p-baz)\n\n"
+            "## Foo\n\ntext\n"
+        )
+        cleaned, changed = self.server._strip_flattened_toc_headings(flattened_toc)
+        self.assertTrue(changed)
+        self.assertNotIn("](#p-foo)", cleaned)
+        self.assertIn("# Title", cleaned)
+        self.assertIn("## Foo", cleaned)
+        self.assertNotIn("\n\n\n", cleaned)
+
+        # A genuine heading with one or two real cross-reference links must
+        # survive untouched — only 3+ same-page anchor links is the signal.
+        real_heading = "# See also [Foo](#foo) and [Bar](#bar)\n\ntext\n"
+        unchanged, changed2 = self.server._strip_flattened_toc_headings(real_heading)
+        self.assertFalse(changed2)
+        self.assertEqual(unchanged, real_heading)
+
+    def test_clean_exported_markdown_rewrites_only_affected_mirror_files(self):
+        mirror = self.server._workspace_export_mirror("demo")
+        mirror.mkdir(parents=True, exist_ok=True)
+        toc_page = mirror / "Page A.md"
+        toc_page.write_text(
+            "# Title\n\n# - [](#p-) - [Foo](#p-foo) - [Bar](#p-bar) - [Baz](#p-baz)\n\ntext\n",
+            encoding="utf-8",
+        )
+        plain_page = mirror / "Page B.md"
+        plain_page.write_text("# Plain\n\ntext\n", encoding="utf-8")
+        plain_mtime_before = plain_page.stat().st_mtime_ns
+
+        cleaned = self.server._clean_exported_markdown(mirror)
+        self.assertEqual(cleaned, ["Page A.md"])
+        self.assertNotIn("](#p-foo)", toc_page.read_text(encoding="utf-8"))
+        # An unaffected file is left byte- and mtime-identical, so the
+        # delivery manifest's change detection is never disturbed for it.
+        self.assertEqual(plain_page.read_text(encoding="utf-8"), "# Plain\n\ntext\n")
+        self.assertEqual(plain_page.stat().st_mtime_ns, plain_mtime_before)
+
     def test_delivery_copies_changed_mirror_files_and_skips_unchanged(self):
         mirror = self.server._workspace_export_mirror("demo")
         inbox = self.server._workspace_untracked("demo")

@@ -76,7 +76,7 @@ def _global_cme_config() -> Path:
 # per-workspace context manager switched APP_CONFIG_PATH around every call.
 os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
 app_data_store.APP_CONFIG_PATH = _global_cme_config()
-_AGENT_VERSION = "0.15.86"
+_AGENT_VERSION = "0.15.87"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -398,6 +398,64 @@ def _write_sync_marker(workspace: str, modified: list[str]) -> None:
         # The flag is an announcement, not the sync itself: a workspace that
         # cannot receive the marker must still get its files.
         pass
+
+
+# Confluence's "Table of Contents" macro exports as a heading whose text is
+# every TOC entry concatenated into one line ("# - [](#p-) - [Foo](#p-foo) -
+# [Bar](#p-bar) ..."), instead of the nested list the macro actually renders
+# in Confluence. llm-wiki already builds its own "On this page" panel from the
+# page's real headings, so this line is a redundant, broken duplicate of that
+# — never authored content — and safe to drop outright rather than try to
+# reformat. Three or more same-page anchor links on one heading line is not
+# something a person writes by hand; a heading with one or two genuine
+# cross-reference links must survive untouched. Counted per-line rather than
+# with one repeating regex: the links are separated by " - [text]" between
+# them, so a pattern requiring the group back-to-back never matches at all.
+_HEADING_LINE_RE = re.compile(r"^#{1,6}[ \t]+")
+_ANCHOR_LINK_RE = re.compile(r"\]\(#[^)\n]*\)")
+
+
+def _strip_flattened_toc_headings(content: str) -> tuple[str, bool]:
+    lines = content.split("\n")
+    kept = [
+        line for line in lines
+        if not (_HEADING_LINE_RE.match(line) and len(_ANCHOR_LINK_RE.findall(line)) >= 3)
+    ]
+    if len(kept) == len(lines):
+        return content, False
+    # Collapse the blank line(s) left behind so the removal never leaves a
+    # visible gap where the macro used to sit.
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
+    return cleaned, True
+
+
+def _clean_exported_markdown(mirror: Path) -> list[str]:
+    """Fixes every exported page in place, once, right after the exporter runs.
+
+    Applied to the MIRROR, not the inbox copy: `_deliver_changed_files` diffs
+    a re-synced page against the existing inbox copy by content
+    (`_same_file_content`) to detect a reader's local edit. Cleaning only the
+    inbox copy would make every already-delivered page mismatch its own
+    (untouched) mirror source on the very next sync, falsely flagging it
+    "modifiedLocally" forever. Cleaning the mirror keeps both sides in the
+    same, already-fixed state, so that check still means what it says.
+    """
+    cleaned_files: list[str] = []
+    if not mirror.is_dir():
+        return cleaned_files
+    for file in sorted(mirror.rglob("*.md")):
+        if not file.is_file():
+            continue
+        try:
+            original = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        cleaned, changed = _strip_flattened_toc_headings(original)
+        if not changed:
+            continue
+        file.write_text(cleaned, encoding="utf-8")
+        cleaned_files.append(file.relative_to(mirror).as_posix())
+    return cleaned_files
 
 
 def _same_file_content(a: Path, b: Path) -> bool:
@@ -1946,6 +2004,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 rc = await _run_cmd([_CME_BIN, "pages-with-descendants", *page_descendant_urls])
             _jobs[job_id]["returncode"] = rc
             if rc == 0:
+                _jobs[job_id]["cleanedTocHeadings"] = _clean_exported_markdown(mirror_path)
                 result = _deliver_changed_files(workspace, mirror_path, output_path)
                 delivered = result["delivered"]
                 modified = result["modified"]
