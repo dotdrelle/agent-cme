@@ -1,0 +1,10 @@
+# Allow-list: the build context carries only what the Dockerfile copies.
+# `data/`, `.cme/` and `.env*` hold Confluence credentials, manifests and
+# exports — they must never reach the builder, let alone a layer.
+# A new COPY needs its own line below, or the build fails with "not found".
+*
+!patch_cme_urls.py
+!cme_mcp_server.py
+!cme_source_urls.py
+!confluence_search.py
+!wiki_search.py
