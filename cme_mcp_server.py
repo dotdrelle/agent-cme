@@ -2203,13 +2203,13 @@ def main() -> None:
     if ssl_certfile or ssl_keyfile:
         missing = [name for name, val in (("MCP_SSL_CERTFILE", ssl_certfile), ("MCP_SSL_KEYFILE", ssl_keyfile)) if not val]
         if missing:
-            raise RuntimeError(f"TLS mal configuré — variables manquantes : {', '.join(missing)}")
+            raise RuntimeError(f"TLS misconfigured — missing variables: {', '.join(missing)}")
         for label, path in (("MCP_SSL_CERTFILE", ssl_certfile), ("MCP_SSL_KEYFILE", ssl_keyfile)):
             if not Path(path).exists():
-                raise RuntimeError(f"TLS mal configuré — fichier introuvable : {label}={path}")
+                raise RuntimeError(f"TLS misconfigured — file not found: {label}={path}")
         uvicorn_kwargs["ssl_certfile"] = ssl_certfile
         uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
-        print(f"[cme-mcp] HTTPS activé — cert={ssl_certfile}")
+        print(f"[cme-mcp] HTTPS enabled — cert={ssl_certfile}")
     else:
         print(f"[cme-mcp] HTTP (pas de TLS)")
 
