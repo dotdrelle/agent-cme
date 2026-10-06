@@ -139,6 +139,7 @@ class CmeMcpServerTest(unittest.TestCase):
         self.workspaces.mkdir()
         (self.workspaces / "demo").mkdir()
         self.server = load_module(self.workspaces, root / "data")
+        self.server._REACHABILITY_VERDICTS.clear()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -846,6 +847,27 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertIn("dev-docs", result)
         self.assertIn("confluence.example:443", result)
         self.assertEqual(set(self.server._jobs), jobs_before)
+
+    def test_a_down_confluence_is_probed_once_across_sources_within_the_ttl(self):
+        calls = []
+
+        async def _never_answers(*args, **_kwargs):
+            calls.append(args)
+            await asyncio.sleep(3600)
+
+        sources = [
+            {"name": "a", "type": "space", "base_url": "https://confluence.example", "space": "A"},
+            {"name": "b", "type": "space", "base_url": "https://confluence.example", "space": "B"},
+        ]
+        with mock.patch.object(self.server, "_REACHABILITY_TIMEOUT_S", 0.05), \
+                mock.patch.object(self.server.asyncio, "open_connection", _never_answers), \
+                mock.patch.object(self.server.urllib.request, "getproxies", return_value={}):
+            first = asyncio.run(self.server._unreachable_sources(sources))
+            second = asyncio.run(self.server._unreachable_sources(sources))
+        self.assertEqual(len(calls), 1, "the same outage is probed once, not once per source")
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertIn("no answer from confluence.example:443", first[0])
 
     def test_reachability_goes_through_the_proxy_unless_the_host_bypasses_it(self):
         with mock.patch.object(self.server.urllib.request, "getproxies", return_value={"https": "http://proxy.corp:3128"}), \

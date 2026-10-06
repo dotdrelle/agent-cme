@@ -78,7 +78,7 @@ def _global_cme_config() -> Path:
 # per-workspace context manager switched APP_CONFIG_PATH around every call.
 os.environ["CME_CONFIG_PATH"] = str(_global_cme_config())
 app_data_store.APP_CONFIG_PATH = _global_cme_config()
-_AGENT_VERSION = "0.16.50"
+_AGENT_VERSION = "0.16.51"
 _AGENT_INSTANCE_ID = os.environ.get("CME_INSTANCE_ID", "cme-main")
 _MAX_TASK_DURATION_MS = int(os.environ.get("CME_MAX_TASK_DURATION_MS", "0") or "0")
 
@@ -1879,6 +1879,12 @@ async def _tool_source_remove(args: dict) -> list[TextContent]:
 # user's ingest queued behind it at 0%. Five seconds to open a TCP connection —
 # to the proxy when one applies — is ample for a reachable instance.
 _REACHABILITY_TIMEOUT_S = 5
+# A down Confluence is ONE outage, not one per source: the manager's routine
+# scan tries each source in its own call, so without a shared verdict five
+# sources cost five probes and five timeouts. Keep the verdict briefly, then
+# probe again — a recovery must not stay hidden for long.
+_REACHABILITY_CACHE_TTL_S = 30
+_REACHABILITY_VERDICTS: dict[tuple[str, int], tuple[float, str | None]] = {}
 
 
 def _connection_target(url: str) -> tuple[str, int] | None:
@@ -1905,16 +1911,21 @@ async def _unreachable_sources(sources: list[dict[str, Any]]) -> list[str]:
             if target is None:
                 continue
             if target not in verdicts:
-                try:
-                    _, writer = await asyncio.wait_for(asyncio.open_connection(*target), _REACHABILITY_TIMEOUT_S)
-                    writer.close()
-                    with contextlib.suppress(Exception):
-                        await writer.wait_closed()
-                    verdicts[target] = None
-                except asyncio.TimeoutError:
-                    verdicts[target] = f"no answer from {target[0]}:{target[1]} within {_REACHABILITY_TIMEOUT_S} s"
-                except OSError as error:
-                    verdicts[target] = f"{target[0]}:{target[1]} refused the connection ({error.strerror or error})"
+                cached = _REACHABILITY_VERDICTS.get(target)
+                if cached and time.monotonic() - cached[0] < _REACHABILITY_CACHE_TTL_S:
+                    verdicts[target] = cached[1]
+                else:
+                    try:
+                        _, writer = await asyncio.wait_for(asyncio.open_connection(*target), _REACHABILITY_TIMEOUT_S)
+                        writer.close()
+                        with contextlib.suppress(Exception):
+                            await writer.wait_closed()
+                        verdicts[target] = None
+                    except asyncio.TimeoutError:
+                        verdicts[target] = f"no answer from {target[0]}:{target[1]} within {_REACHABILITY_TIMEOUT_S} s"
+                    except OSError as error:
+                        verdicts[target] = f"{target[0]}:{target[1]} refused the connection ({error.strerror or error})"
+                    _REACHABILITY_VERDICTS[target] = (time.monotonic(), verdicts[target])
             if verdicts[target]:
                 unreachable.append(f"{source.get('name')} ({source_url}): {verdicts[target]}")
     return unreachable
