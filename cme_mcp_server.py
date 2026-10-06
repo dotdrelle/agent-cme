@@ -12,6 +12,8 @@ import re
 import shutil
 import sys
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -1872,6 +1874,52 @@ async def _tool_source_remove(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=f"OK: source '{name}' removed")]
 
 
+# An unreachable Confluence (no VPN, host down) left the exporter waiting with
+# no end: on juno a maintenance sync held raw/untracked for 20+ minutes and the
+# user's ingest queued behind it at 0%. Five seconds to open a TCP connection —
+# to the proxy when one applies — is ample for a reachable instance.
+_REACHABILITY_TIMEOUT_S = 5
+
+
+def _connection_target(url: str) -> tuple[str, int] | None:
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname:
+        return None
+    scheme = parsed.scheme or "https"
+    proxy = urllib.request.getproxies().get(scheme)
+    if proxy and not urllib.request.proxy_bypass(parsed.hostname):
+        proxied = urllib.parse.urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        if proxied.hostname:
+            return proxied.hostname, proxied.port or (443 if proxied.scheme == "https" else 80)
+    return parsed.hostname, parsed.port or (443 if scheme == "https" else 80)
+
+
+async def _unreachable_sources(sources: list[dict[str, Any]]) -> list[str]:
+    """Sources whose Confluence does not accept a connection within 5 s."""
+    verdicts: dict[tuple[str, int], str | None] = {}
+    unreachable = []
+    for source in sources:
+        with contextlib.suppress(KeyError, TypeError):
+            source_url = _source_url(source)
+            target = _connection_target(source_url)
+            if target is None:
+                continue
+            if target not in verdicts:
+                try:
+                    _, writer = await asyncio.wait_for(asyncio.open_connection(*target), _REACHABILITY_TIMEOUT_S)
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+                    verdicts[target] = None
+                except asyncio.TimeoutError:
+                    verdicts[target] = f"no answer from {target[0]}:{target[1]} within {_REACHABILITY_TIMEOUT_S} s"
+                except OSError as error:
+                    verdicts[target] = f"{target[0]}:{target[1]} refused the connection ({error.strerror or error})"
+            if verdicts[target]:
+                unreachable.append(f"{source.get('name')} ({source_url}): {verdicts[target]}")
+    return unreachable
+
+
 async def _tool_export_run(args: dict) -> list[TextContent]:
     workspace = str(args.get("workspace", "")).strip()
     workspace_path = _validate_workspace(workspace)
@@ -1921,6 +1969,14 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
             + "\n".join(f"  - {item}" for item in unconfigured)
             + "\nCredentials are agent-wide: call cme_setup(base_url=..., username=..., pat=...) "
             "once for each missing instance (shared across all workspaces)."
+        ))]
+
+    unreachable = await _unreachable_sources(sources)
+    if unreachable:
+        return [TextContent(type="text", text=(
+            "Error: Confluence unreachable, export not started:\n"
+            + "\n".join(f"  - {item}" for item in unreachable)
+            + "\nCheck the network (VPN, proxy) and run the export again."
         ))]
 
     space_urls = [

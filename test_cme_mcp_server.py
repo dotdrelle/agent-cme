@@ -801,6 +801,10 @@ class CmeMcpServerTest(unittest.TestCase):
         # Never spawn the real CME binary: the job must fail its first step.
         self.server._CME_BIN = "/nonexistent/cme-bin"
 
+        async def _reachable(_sources):
+            return []
+        self.server._unreachable_sources = _reachable
+
         async def _run_and_stop():
             result = await self.server._tool_export_run({"workspace": "demo"})
             job_id = json.loads(result[0].text)["job_id"]
@@ -815,6 +819,41 @@ class CmeMcpServerTest(unittest.TestCase):
         payload = json.loads(result[0].text)
         self.assertTrue(payload["ok"])
         self.assertEqual(self.server._jobs[job_id]["config_path"], str(self.server._global_cme_config()))
+
+    def test_export_run_refuses_an_unreachable_confluence_without_starting_a_job(self):
+        asyncio.run(self.server._tool_setup({
+            "base_url": "https://confluence.example",
+            "username": "user@example.com",
+            "pat": "secret-pat",
+        }))
+        asyncio.run(self.server._tool_source_add({
+            "workspace": "demo",
+            "name": "dev-docs",
+            "type": "space",
+            "base_url": "https://confluence.example",
+            "space": "DEV",
+        }))
+
+        async def _never_answers(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        jobs_before = set(self.server._jobs)
+        with mock.patch.object(self.server, "_REACHABILITY_TIMEOUT_S", 0.05), \
+                mock.patch.object(self.server.asyncio, "open_connection", _never_answers), \
+                mock.patch.object(self.server.urllib.request, "getproxies", return_value={}):
+            result = asyncio.run(self.server._tool_export_run({"workspace": "demo"}))[0].text
+        self.assertIn("Confluence unreachable, export not started", result)
+        self.assertIn("dev-docs", result)
+        self.assertIn("confluence.example:443", result)
+        self.assertEqual(set(self.server._jobs), jobs_before)
+
+    def test_reachability_goes_through_the_proxy_unless_the_host_bypasses_it(self):
+        with mock.patch.object(self.server.urllib.request, "getproxies", return_value={"https": "http://proxy.corp:3128"}), \
+                mock.patch.object(self.server.urllib.request, "proxy_bypass", return_value=False):
+            self.assertEqual(self.server._connection_target("https://confluence.example/display/DEV"), ("proxy.corp", 3128))
+        with mock.patch.object(self.server.urllib.request, "getproxies", return_value={"https": "http://proxy.corp:3128"}), \
+                mock.patch.object(self.server.urllib.request, "proxy_bypass", return_value=True):
+            self.assertEqual(self.server._connection_target("https://confluence.example:8443/x"), ("confluence.example", 8443))
 
     def test_migration_merges_legacy_workspace_configs_into_the_shared_one(self):
         legacy_a = self.server._DATA_DIR / "old-a" / "cme" / "app_data.json"
