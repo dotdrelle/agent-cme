@@ -258,18 +258,18 @@ class CmeMcpServerTest(unittest.TestCase):
         # Same content again: nothing new is delivered — the downstream ingest
         # sees an empty inbox instead of re-processing the whole export.
         second = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(second, {"delivered": [], "modified": []})
+        self.assertEqual(second, {"delivered": [], "modified": [], "locked": []})
 
         # A changed page is re-delivered, and only that page.
         (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
         third = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(third, {"delivered": ["DEV/Page A.md"], "modified": []})
+        self.assertEqual(third, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": []})
 
         # A page deleted upstream leaves the manifest too, so a recreated page
         # would be delivered again instead of being masked by a stale stamp.
         (mirror / "DEV" / "Page B.md").unlink()
         fourth = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(fourth, {"delivered": [], "modified": []})
+        self.assertEqual(fourth, {"delivered": [], "modified": [], "locked": []})
         manifest = self.server._read_delivery_manifest("demo")
         self.assertIn("DEV/Page A.md", manifest)
         self.assertNotIn("DEV/Page B.md", manifest)
@@ -288,7 +288,7 @@ class CmeMcpServerTest(unittest.TestCase):
         # Deleted: the sync leaves it alone — no resurrection.
         (inbox / "DEV" / "Page A.md").unlink()
         quiet = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(quiet, {"delivered": [], "modified": []})
+        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": []})
         self.assertFalse((inbox / "DEV" / "Page A.md").exists())
         self.assertFalse(self.server._sync_marker_path("demo").exists())
 
@@ -299,7 +299,7 @@ class CmeMcpServerTest(unittest.TestCase):
 
         # Edited (even with an identical length): not overwritten, flagged.
         flagged = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(flagged, {"delivered": [], "modified": ["DEV/Page A.md"]})
+        self.assertEqual(flagged, {"delivered": [], "modified": ["DEV/Page A.md"], "locked": []})
         self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), "# A edited by the reader")
         marker = json.loads(self.server._sync_marker_path("demo").read_text(encoding="utf-8"))
         self.assertEqual(marker["modifiedLocally"], ["DEV/Page A.md"])
@@ -307,8 +307,31 @@ class CmeMcpServerTest(unittest.TestCase):
         # Unchanged copy: nothing to flag, and the marker clears.
         (inbox / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
         quiet = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(quiet, {"delivered": [], "modified": []})
+        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": []})
         self.assertFalse(self.server._sync_marker_path("demo").exists())
+
+    def test_delivery_never_brings_back_a_source_the_reader_locked(self):
+        # A source locked from the Pending panel is `a.md.lock`: a newer page
+        # upstream must not land as `a.md` beside it — the lock is the
+        # reader's decision, and the page arrives once they unlock.
+        mirror = self.server._workspace_export_mirror("demo")
+        inbox = self.server._workspace_untracked("demo")
+        (mirror / "DEV").mkdir(parents=True)
+        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
+        self.server._deliver_changed_files("demo", mirror, inbox)
+        (inbox / "DEV" / "Page A.md").rename(inbox / "DEV" / "Page A.md.lock")
+
+        (mirror / "DEV" / "Page A.md").write_text("# A v2, changed upstream", encoding="utf-8")
+        held = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(held, {"delivered": [], "modified": [], "locked": ["DEV/Page A.md"]})
+        self.assertFalse((inbox / "DEV" / "Page A.md").exists())
+        self.assertEqual((inbox / "DEV" / "Page A.md.lock").read_text(encoding="utf-8"), "# A")
+
+        # Unlocked: the next sync delivers the newer page.
+        (inbox / "DEV" / "Page A.md.lock").rename(inbox / "DEV" / "Page A.md")
+        fresh = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(fresh, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": []})
+        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), "# A v2, changed upstream")
 
     def test_export_counts_are_parsed_from_stdout(self):
         exported, unchanged = self.server._parse_export_counts([

@@ -476,6 +476,11 @@ def _same_file_content(a: Path, b: Path) -> bool:
         return False
 
 
+# Suffix the Pending panel appends to lock a source out of ingestion
+# (llm-wiki's PENDING_LOCK_SUFFIX): `a.md.lock`.
+_PENDING_LOCK_SUFFIX = ".lock"
+
+
 def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[str, list[str]]:
     """Copy mirror files whose content changed since the last delivery.
 
@@ -492,10 +497,15 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
       resurrects local work it did not make;
     - a pending file the reader MODIFIED is not overwritten either: it is
       reported in "modified" and flagged orange in the Pending panel through
-      .wiki/cme-sync.json, and keeping or deleting it is the reader's call.
+      .wiki/cme-sync.json, and keeping or deleting it is the reader's call;
+    - a pending file the reader LOCKED out of ingestion (renamed `a.md.lock`
+      from the Pending panel) is not delivered again beside its lock, even when
+      the page changed upstream — it is reported in "locked", and its manifest
+      stamp is left as is so the newer page arrives once the reader unlocks.
 
-    Returns {"delivered": [...], "modified": [...]}: delivered is what the
-    exporter changed, modified is what the reader changed since delivery.
+    Returns {"delivered": [...], "modified": [...], "locked": [...]}: delivered
+    is what the exporter changed, modified is what the reader changed since
+    delivery, locked is what the reader froze.
     """
     lockfile_name = "export.lock.json"
     try:
@@ -505,6 +515,7 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
     manifest = _read_delivery_manifest(workspace)
     delivered: list[str] = []
     modified: list[str] = []
+    locked: list[str] = []
     seen: set[str] = set()
     if mirror.is_dir():
         for file in sorted(mirror.rglob("*")):
@@ -519,6 +530,9 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
             except OSError:
                 continue
             inbox_copy = inbox / relative
+            if inbox_copy.with_name(f"{inbox_copy.name}{_PENDING_LOCK_SUFFIX}").is_file():
+                locked.append(relative)
+                continue
             if manifest.get(relative) == stamp:
                 # Mirror unchanged since last delivery: nothing to fetch. A
                 # locally modified copy is announced, never overwritten.
@@ -533,7 +547,7 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
         del manifest[key]
     _write_delivery_manifest(workspace, manifest)
     _write_sync_marker(workspace, modified)
-    return {"delivered": delivered, "modified": modified}
+    return {"delivered": delivered, "modified": modified, "locked": locked}
 
 
 def _pending_deliveries(workspace: str, inbox: Path) -> list[str]:
@@ -736,6 +750,7 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
             label = f"{label} +{len(sources) - 3}"
     delivered = job.get("delivered")
     modified = job.get("modifiedLocally")
+    locked = job.get("lockedLocally")
     return {
         "id": job_id,
         "source": "cme",
@@ -752,6 +767,7 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
             "unchanged": job.get("unchanged"),
             "delivered": len(delivered) if isinstance(delivered, list) else delivered,
             "modifiedLocally": len(modified) if isinstance(modified, list) else modified,
+            "lockedLocally": len(locked) if isinstance(locked, list) else locked,
             "changed": job.get("changed"),
         } if "delivered" in job else {}),
         "poll": {
@@ -2078,6 +2094,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 exported, unchanged = _parse_export_counts(list(_jobs[job_id].get("stdout") or []))
                 _jobs[job_id]["delivered"] = delivered
                 _jobs[job_id]["modifiedLocally"] = modified
+                _jobs[job_id]["lockedLocally"] = result["locked"]
                 _jobs[job_id]["exported"] = exported
                 _jobs[job_id]["unchanged"] = unchanged
                 # "Changed" is decided by what was delivered, never by the
