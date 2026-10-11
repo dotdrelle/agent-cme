@@ -800,7 +800,7 @@ def _json_payload(result: list[TextContent]) -> dict[str, Any]:
 
 # The orchestrator plans against this schema alone, and a planner LLM fills any
 # bare `{"type": "string"}` with whatever string the objective contains — for an
-# objective like "export the Confluence pages of workspace acpi" that is the
+# objective like "export the Confluence pages of workspace atlas" that is the
 # WORKSPACE name, which is never a source name. The meaning of the field has to
 # live here, in the agent's own contract: the manager is business-agnostic and
 # must not carry per-agent knowledge.
@@ -833,7 +833,7 @@ def _declared_source_names(workspace: str) -> list[str]:
 def _agent_description(workspace: str = "") -> dict[str, Any]:
     # source_name is a reference to an already-declared entity, not free text.
     # Published as a bare string it is unverifiable, and a planner LLM fills it
-    # with whichever noun the objective contains ("acpi", "Confluence"). The
+    # with whichever noun the objective contains ("atlas", "Confluence"). The
     # closed vocabulary is known here and nowhere else, so publish it: an enum
     # is the only form the orchestrator can check without guessing at meaning.
     source_names = _declared_source_names(workspace)
@@ -1891,7 +1891,7 @@ async def _tool_source_remove(args: dict) -> list[TextContent]:
 
 
 # An unreachable Confluence (no VPN, host down) left the exporter waiting with
-# no end: on juno a maintenance sync held raw/untracked for 20+ minutes and the
+# no end: on lyra a maintenance sync held raw/untracked for 20+ minutes and the
 # user's ingest queued behind it at 0%. Five seconds to open a TCP connection —
 # to the proxy when one applies — is ample for a reachable instance.
 _REACHABILITY_TIMEOUT_S = 5

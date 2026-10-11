@@ -450,7 +450,7 @@ class CmeMcpServerTest(unittest.TestCase):
         }))
         asyncio.run(self.server._tool_source_add({
             "workspace": "demo",
-            "name": "EAS_Avant_projet_ACPI",
+            "name": "Sample_source",
             "type": "page-with-descendants",
             "url": "http://confluence.example/spaces/ODG/pages/1/EAS",
         }))
@@ -459,8 +459,8 @@ class CmeMcpServerTest(unittest.TestCase):
         schema = described["capabilities"][0]["inputSchema"]["properties"]["source_name"]
 
         # Without the enum, a planner fills this field with any noun from the
-        # objective ("acpi", "Confluence") and the task fails.
-        self.assertEqual(schema["enum"], ["EAS_Avant_projet_ACPI"])
+        # objective ("atlas", "Confluence") and the task fails.
+        self.assertEqual(schema["enum"], ["Sample_source"])
 
     def test_describe_without_a_workspace_publishes_no_vocabulary(self):
         described = json.loads(self.server._tool_agent_describe()[0].text)
@@ -480,7 +480,7 @@ class CmeMcpServerTest(unittest.TestCase):
         asyncio.run(self.server._tool_setup(args))
         asyncio.run(self.server._tool_source_add({
             "workspace": "demo",
-            "name": "EAS_Avant_projet_ACPI",
+            "name": "Sample_source",
             "type": "page-with-descendants",
             "url": "http://confluence.example/spaces/ODG/pages/1/EAS",
         }))
@@ -492,7 +492,7 @@ class CmeMcpServerTest(unittest.TestCase):
 
         self.assertIn("not found", result)
         # The reader must be able to act on this without a second round-trip.
-        self.assertIn("EAS_Avant_projet_ACPI", result)
+        self.assertIn("Sample_source", result)
         self.assertIn("Omit source_name", result)
 
     def test_agent_execute_is_idempotent_for_same_key(self):
