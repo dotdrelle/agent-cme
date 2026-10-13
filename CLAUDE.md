@@ -80,7 +80,17 @@ retry with a known `idempotencyKey` returns the existing job or result.
   count toward `changed`.
 - `cme_export_run` and `cme_export_status(job_id=...)` should return JSON with
   additive `_activity` metadata so managers can poll progress through
-  `cme.cme_export_status` without parsing CME-specific text.
+  `cme.cme_export_status` without parsing CME-specific text. Progress carries
+  `facts` (`_job_facts`: sources, exported/unchanged/delivered counts, locally
+  modified/locked, the error when failed) — data only, never a sentence: the
+  manager's step narrator words them in the workspace language.
+- Delivery skips near-empty pages (`_is_thin_page`: under `_MIN_CONTENT_CHARS`
+  = 80 letters/digits once front matter, headings, images, table rules and
+  link-only lines are set aside — a container page's child list counts zero).
+  They are reported as `skippedEmpty`, their manifest stamp is recorded so an
+  unchanged one is not weighed again, and they arrive once filled upstream.
+  A fixed floor on purpose, not a setting. The former
+  `stdout=N stderr=M` detail counted log lines and is gone.
 - Keep `agent-cme` workspace-agnostic. Workspace names are request parameters,
   not container configuration. **Credentials and connection settings are
   agent-wide**: they live in the single shared config

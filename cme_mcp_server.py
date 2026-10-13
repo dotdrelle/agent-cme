@@ -481,6 +481,46 @@ def _same_file_content(a: Path, b: Path) -> bool:
 _PENDING_LOCK_SUFFIX = ".lock"
 
 
+# Below this much substantive text a page is not delivered: a Confluence
+# container page (a title, a breadcrumb, the list of its children) or a blank
+# one would cost an ingest LLM cycle for an empty fiche. A fixed floor, not a
+# setting: it only has to tell "nothing to say" from "something to say".
+_MIN_CONTENT_CHARS = 80
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.S)
+_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_LIST_MARKER_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+_TABLE_RULE_RE = re.compile(r"[|:\-\s]+")
+
+
+def _substantive_chars(text: str) -> int:
+    """Letters and digits a reader would actually read on the page.
+
+    Front matter, headings (the title alone says nothing), images, table rules,
+    HTML tags and lines made only of links — the child-page list of a
+    container page — do not count; the text of a link inside a sentence does.
+    """
+    count = 0
+    for line in _FRONTMATTER_RE.sub("", text, count=1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or _TABLE_RULE_RE.fullmatch(stripped):
+            continue
+        stripped = re.sub(r"<[^>]+>", "", _IMAGE_RE.sub("", stripped))
+        if not _LINK_RE.sub("", _LIST_MARKER_RE.sub("", stripped)).strip(" \t.,;:|-*"):
+            continue
+        count += sum(1 for char in _LINK_RE.sub(r"\1", stripped) if char.isalnum())
+    return count
+
+
+def _is_thin_page(file: Path) -> bool:
+    if file.suffix.lower() != ".md":
+        return False
+    try:
+        return _substantive_chars(file.read_text(encoding="utf-8")) < _MIN_CONTENT_CHARS
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[str, list[str]]:
     """Copy mirror files whose content changed since the last delivery.
 
@@ -503,9 +543,14 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
       the page changed upstream — it is reported in "locked", and its manifest
       stamp is left as is so the newer page arrives once the reader unlocks.
 
-    Returns {"delivered": [...], "modified": [...], "locked": [...]}: delivered
-    is what the exporter changed, modified is what the reader changed since
-    delivery, locked is what the reader froze.
+    - a page with almost no content (`_is_thin_page`) is not delivered at all:
+      it is reported in "thin", and its stamp is recorded so it is looked at
+      again only when the page changes upstream.
+
+    Returns {"delivered": [...], "modified": [...], "locked": [...], "thin": [...]}:
+    delivered is what the exporter changed, modified is what the reader changed
+    since delivery, locked is what the reader froze, thin is what was too empty
+    to be worth an ingest.
     """
     lockfile_name = "export.lock.json"
     try:
@@ -516,6 +561,7 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
     delivered: list[str] = []
     modified: list[str] = []
     locked: list[str] = []
+    thin: list[str] = []
     seen: set[str] = set()
     if mirror.is_dir():
         for file in sorted(mirror.rglob("*")):
@@ -539,6 +585,10 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
                 if inbox_copy.is_file() and not _same_file_content(file, inbox_copy):
                     modified.append(relative)
                 continue
+            if _is_thin_page(file):
+                manifest[relative] = stamp
+                thin.append(relative)
+                continue
             inbox_copy.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file, inbox_copy)
             manifest[relative] = stamp
@@ -547,7 +597,7 @@ def _deliver_changed_files(workspace: str, mirror: Path, inbox: Path) -> dict[st
         del manifest[key]
     _write_delivery_manifest(workspace, manifest)
     _write_sync_marker(workspace, modified)
-    return {"delivered": delivered, "modified": modified, "locked": locked}
+    return {"delivered": delivered, "modified": modified, "locked": locked, "thin": thin}
 
 
 def _pending_deliveries(workspace: str, inbox: Path) -> list[str]:
@@ -729,6 +779,31 @@ def _migrate_legacy_workspace_configs() -> list[str]:
     return notices
 
 
+def _job_facts(job: dict[str, Any]) -> dict[str, Any]:
+    """What the export did, as data — never a sentence.
+
+    The manager's narrator words these in the workspace language; the former
+    detail ("stdout=90 stderr=0") counted log lines and said nothing.
+    """
+    def count(value: Any) -> Any:
+        return len(value) if isinstance(value, list) else value
+
+    facts: dict[str, Any] = {
+        "sources": [str(source) for source in (job.get("sources") or [])[:5]],
+        "exported": job.get("exported"),
+        "unchanged": job.get("unchanged"),
+        "delivered": count(job.get("delivered")),
+        "modifiedLocally": count(job.get("modifiedLocally")),
+        "lockedLocally": count(job.get("lockedLocally")),
+        "skippedEmpty": count(job.get("skippedEmpty")),
+    }
+    status = str(job.get("status") or "")
+    if status in {"failed", "error"}:
+        errors = [line for line in (job.get("stderr") or []) if str(line).strip()]
+        facts["error"] = str(job.get("error") or (errors[-1] if errors else ""))[:300]
+    return {key: value for key, value in facts.items() if value not in (None, [], "")}
+
+
 def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "running")
     sources = job.get("sources") or []
@@ -759,8 +834,7 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "progress": {
             "step": "export",
-            "stdoutLines": len(job.get("stdout") or []),
-            "stderrLines": len(job.get("stderr") or []),
+            "facts": _job_facts(job),
         },
         **({
             "exported": job.get("exported"),
@@ -1085,8 +1159,6 @@ def _agent_task_result(job: dict[str, Any]) -> dict[str, Any]:
 
 def _agent_task_status(job_id: str, job: dict[str, Any], task_id: Any = None) -> dict[str, Any]:
     status = str(job.get("status") or "unknown")
-    stdout = job.get("stdout") or []
-    stderr = job.get("stderr") or []
     payload = {
         "jobId": job_id,
         "taskId": task_id,
@@ -1097,7 +1169,7 @@ def _agent_task_status(job_id: str, job: dict[str, Any], task_id: Any = None) ->
         "progress": {
             "percent": 100 if _agent_status_value(status) == "done" else 0,
             "phase": "export",
-            "detail": f"stdout={len(stdout)} stderr={len(stderr)}",
+            "facts": _job_facts(job),
         },
         "startedAt": job.get("started_at"),
         "updatedAt": job.get("finished_at") or _now(),
@@ -1388,6 +1460,8 @@ async def list_tools() -> list[Tool]:
                 "Unchanged Confluence pages are skipped and only changed files are staged in raw/untracked: when the job finishes with "
                 "changed=false (delivered=0), nothing changed since the last export — report that as a normal, up-to-date outcome, "
                 "never as content that was refreshed. "
+                "Pages with almost no content (a container page, a blank page) are not staged: they are counted in "
+                "skippedEmpty, so no ingest is spent on an empty page. "
                 "Returns a job_id immediately. Use cme_export_status(job_id=...) to follow progress."
             ),
             inputSchema={
@@ -2095,6 +2169,7 @@ async def _tool_export_run(args: dict) -> list[TextContent]:
                 _jobs[job_id]["delivered"] = delivered
                 _jobs[job_id]["modifiedLocally"] = modified
                 _jobs[job_id]["lockedLocally"] = result["locked"]
+                _jobs[job_id]["skippedEmpty"] = result["thin"]
                 _jobs[job_id]["exported"] = exported
                 _jobs[job_id]["unchanged"] = unchanged
                 # "Changed" is decided by what was delivered, never by the
@@ -2202,6 +2277,8 @@ async def _tool_export_status(args: dict) -> list[TextContent]:
                 "deliveredFiles": delivered[:20] if isinstance(delivered, list) else [],
                 "modifiedLocally": len(modified) if isinstance(modified, list) else modified,
                 "modifiedLocallyFiles": modified[:20] if isinstance(modified, list) else [],
+                "skippedEmpty": len(job.get("skippedEmpty") or []),
+                "skippedEmptyFiles": (job.get("skippedEmpty") or [])[:20],
                 "changed": job.get("changed"),
             } if "delivered" in job else {}),
             "stdout_tail": stdout[-20:],

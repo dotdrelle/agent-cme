@@ -15,8 +15,18 @@ from unittest import mock
 
 STORE = {}
 
+# A page with something to say: the delivery no longer stages near-empty pages.
+PAGE_BODY = ("The steering committee reviews architecture decisions, follows the project risks "
+             "and records every arbitration with its owner and its due date.")
+
+
+def page(title: str) -> str:
+    return f"{title}\n\n{PAGE_BODY}"
+
+
 
 @dataclass
+
 class TextContent:
     type: str
     text: str
@@ -246,8 +256,8 @@ class CmeMcpServerTest(unittest.TestCase):
         inbox = self.server._workspace_untracked("demo")
         (mirror / "DEV").mkdir(parents=True)
         (mirror / "export.lock.json").write_text("{}", encoding="utf-8")
-        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
-        (mirror / "DEV" / "Page B.md").write_text("# B", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A"), encoding="utf-8")
+        (mirror / "DEV" / "Page B.md").write_text(page("# B"), encoding="utf-8")
 
         first = self.server._deliver_changed_files("demo", mirror, inbox)
         self.assertEqual(sorted(first["delivered"]), ["DEV/Page A.md", "DEV/Page B.md"])
@@ -258,21 +268,52 @@ class CmeMcpServerTest(unittest.TestCase):
         # Same content again: nothing new is delivered — the downstream ingest
         # sees an empty inbox instead of re-processing the whole export.
         second = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(second, {"delivered": [], "modified": [], "locked": []})
+        self.assertEqual(second, {"delivered": [], "modified": [], "locked": [], "thin": []})
 
         # A changed page is re-delivered, and only that page.
-        (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A v2"), encoding="utf-8")
         third = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(third, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": []})
+        self.assertEqual(third, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": [], "thin": []})
 
         # A page deleted upstream leaves the manifest too, so a recreated page
         # would be delivered again instead of being masked by a stale stamp.
         (mirror / "DEV" / "Page B.md").unlink()
         fourth = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(fourth, {"delivered": [], "modified": [], "locked": []})
+        self.assertEqual(fourth, {"delivered": [], "modified": [], "locked": [], "thin": []})
         manifest = self.server._read_delivery_manifest("demo")
         self.assertIn("DEV/Page A.md", manifest)
         self.assertNotIn("DEV/Page B.md", manifest)
+
+    def test_delivery_skips_a_page_with_almost_no_content(self):
+        mirror = self.server._workspace_export_mirror("demo")
+        inbox = self.server._workspace_untracked("demo")
+        (mirror / "DEV").mkdir(parents=True)
+        # A container page: title, breadcrumb-like heading and its child list.
+        (mirror / "DEV" / "Parent.md").write_text(
+            "---\ntitle: Parent\n---\n# Parent\n## Child pages\n- [Child one](Child one.md)\n- [Child two](Child two.md)\n"
+            "![diagram](img.png)\n| a | b |\n|---|---|\n",
+            encoding="utf-8",
+        )
+        (mirror / "DEV" / "Blank.md").write_text("# Blank\n\n", encoding="utf-8")
+        (mirror / "DEV" / "Real.md").write_text(page("# Real"), encoding="utf-8")
+
+        first = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(first["delivered"], ["DEV/Real.md"])
+        self.assertEqual(first["thin"], ["DEV/Blank.md", "DEV/Parent.md"])
+        self.assertFalse((inbox / "DEV" / "Parent.md").exists())
+        # Recorded: an unchanged empty page is not weighed again on every sync.
+        again = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(again["thin"], [])
+        # Filled upstream, it is delivered.
+        (mirror / "DEV" / "Blank.md").write_text(page("# Blank"), encoding="utf-8")
+        filled = self.server._deliver_changed_files("demo", mirror, inbox)
+        self.assertEqual(filled["delivered"], ["DEV/Blank.md"])
+
+    def test_substantive_chars_counts_what_a_reader_reads(self):
+        count = self.server._substantive_chars
+        self.assertEqual(count("# Title only\n"), 0)
+        self.assertEqual(count("- [Child](x.md)\n* [Other](y.md)\n"), 0)
+        self.assertEqual(count("See [the plan](p.md) today."), len("Settheplantoday"))
 
     def test_delivery_never_resurrects_or_overwrites_the_readers_inbox_copy(self):
         # wiki-sync is the SOURCE's fetch path, not a git checkout: a deleted
@@ -282,32 +323,32 @@ class CmeMcpServerTest(unittest.TestCase):
         inbox = self.server._workspace_untracked("demo")
         (mirror / "DEV").mkdir(parents=True)
         (mirror / "export.lock.json").write_text("{}", encoding="utf-8")
-        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A"), encoding="utf-8")
         self.server._deliver_changed_files("demo", mirror, inbox)
 
         # Deleted: the sync leaves it alone — no resurrection.
         (inbox / "DEV" / "Page A.md").unlink()
         quiet = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": []})
+        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": [], "thin": []})
         self.assertFalse((inbox / "DEV" / "Page A.md").exists())
         self.assertFalse(self.server._sync_marker_path("demo").exists())
 
         # Re-delivered first (mirror changed), then edited locally.
-        (mirror / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A v2"), encoding="utf-8")
         self.server._deliver_changed_files("demo", mirror, inbox)
-        (inbox / "DEV" / "Page A.md").write_text("# A edited by the reader", encoding="utf-8")
+        (inbox / "DEV" / "Page A.md").write_text(page("# A edited by the reader"), encoding="utf-8")
 
         # Edited (even with an identical length): not overwritten, flagged.
         flagged = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(flagged, {"delivered": [], "modified": ["DEV/Page A.md"], "locked": []})
-        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), "# A edited by the reader")
+        self.assertEqual(flagged, {"delivered": [], "modified": ["DEV/Page A.md"], "locked": [], "thin": []})
+        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), page("# A edited by the reader"))
         marker = json.loads(self.server._sync_marker_path("demo").read_text(encoding="utf-8"))
         self.assertEqual(marker["modifiedLocally"], ["DEV/Page A.md"])
 
         # Unchanged copy: nothing to flag, and the marker clears.
-        (inbox / "DEV" / "Page A.md").write_text("# A v2", encoding="utf-8")
+        (inbox / "DEV" / "Page A.md").write_text(page("# A v2"), encoding="utf-8")
         quiet = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": []})
+        self.assertEqual(quiet, {"delivered": [], "modified": [], "locked": [], "thin": []})
         self.assertFalse(self.server._sync_marker_path("demo").exists())
 
     def test_delivery_never_brings_back_a_source_the_reader_locked(self):
@@ -317,21 +358,21 @@ class CmeMcpServerTest(unittest.TestCase):
         mirror = self.server._workspace_export_mirror("demo")
         inbox = self.server._workspace_untracked("demo")
         (mirror / "DEV").mkdir(parents=True)
-        (mirror / "DEV" / "Page A.md").write_text("# A", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A"), encoding="utf-8")
         self.server._deliver_changed_files("demo", mirror, inbox)
         (inbox / "DEV" / "Page A.md").rename(inbox / "DEV" / "Page A.md.lock")
 
-        (mirror / "DEV" / "Page A.md").write_text("# A v2, changed upstream", encoding="utf-8")
+        (mirror / "DEV" / "Page A.md").write_text(page("# A v2, changed upstream"), encoding="utf-8")
         held = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(held, {"delivered": [], "modified": [], "locked": ["DEV/Page A.md"]})
+        self.assertEqual(held, {"delivered": [], "modified": [], "locked": ["DEV/Page A.md"], "thin": []})
         self.assertFalse((inbox / "DEV" / "Page A.md").exists())
-        self.assertEqual((inbox / "DEV" / "Page A.md.lock").read_text(encoding="utf-8"), "# A")
+        self.assertEqual((inbox / "DEV" / "Page A.md.lock").read_text(encoding="utf-8"), page("# A"))
 
         # Unlocked: the next sync delivers the newer page.
         (inbox / "DEV" / "Page A.md.lock").rename(inbox / "DEV" / "Page A.md")
         fresh = self.server._deliver_changed_files("demo", mirror, inbox)
-        self.assertEqual(fresh, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": []})
-        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), "# A v2, changed upstream")
+        self.assertEqual(fresh, {"delivered": ["DEV/Page A.md"], "modified": [], "locked": [], "thin": []})
+        self.assertEqual((inbox / "DEV" / "Page A.md").read_text(encoding="utf-8"), page("# A v2, changed upstream"))
 
     def test_export_counts_are_parsed_from_stdout(self):
         exported, unchanged = self.server._parse_export_counts([
@@ -565,6 +606,9 @@ class CmeMcpServerTest(unittest.TestCase):
 
         self.assertEqual(status["status"], "running")
         self.assertEqual(status["taskId"], "task-cme")
+        # Facts as data for the manager's narrator, never a log-line count.
+        self.assertEqual(status["progress"]["facts"], {"sources": ["docs"]})
+        self.assertNotIn("detail", status["progress"])
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertEqual(cancelled["result"]["status"], "cancelled")
 
