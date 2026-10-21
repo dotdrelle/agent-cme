@@ -1786,7 +1786,11 @@ async def _tool_confluence_search(args: dict) -> list[TextContent]:
     settings = get_settings()
     source_url = _workspace_source_url(workspace, settings)
     try:
-        payload = search_confluence(
+        # urlopen blocks: run off the event loop. Called inline, an unreachable
+        # Confluence froze the WHOLE agent for up to 30 s — every other CME
+        # call (even a local wiki search) timed out behind it.
+        payload = await asyncio.to_thread(
+            search_confluence,
             settings,
             query=args.get("query"),
             cql=args.get("cql"),
@@ -1806,7 +1810,8 @@ async def _tool_wiki_search(args: dict) -> list[TextContent]:
     """Live wiki search (wiki_search.py) — read-only, walks the workspace wiki."""
     workspace = _workspace_name(str(args.get("workspace", "")).strip())
     try:
-        payload = search_wiki(
+        payload = await asyncio.to_thread(
+            search_wiki,
             _WORKSPACES_ROOT,
             workspace,
             str(args.get("query", "")),

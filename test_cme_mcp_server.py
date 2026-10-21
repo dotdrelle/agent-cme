@@ -1063,6 +1063,34 @@ class CmeMcpServerTest(unittest.TestCase):
         self.assertTrue(legacy_b.with_name("app_data.json.migrated").exists())
         self.assertTrue(legacy_c.with_name("app_data.json.migrated").exists())
 
+    def test_a_slow_confluence_search_never_blocks_other_calls(self):
+        # Observed: Confluence unreachable, search_confluence held the event
+        # loop for 30 s and every other CME call — a local wiki search
+        # included — timed out behind it in the manager.
+        import threading
+        import time
+
+        released = threading.Event()
+
+        def slow_search(*_args, **_kwargs):
+            released.wait(2)
+            return {"ok": True, "results": []}
+
+        async def scenario():
+            with mock.patch.object(self.server, "search_confluence", slow_search), \
+                 mock.patch.object(self.server, "_workspace_source_url", lambda *_: None), \
+                 mock.patch.object(self.server, "search_wiki", lambda *_a, **_k: {"ok": True, "results": []}):
+                started = time.monotonic()
+                confluence = asyncio.create_task(self.server._tool_confluence_search({"workspace": "demo", "query": "x"}))
+                await asyncio.sleep(0)
+                await self.server._tool_wiki_search({"workspace": "demo", "query": "x"})
+                elapsed = time.monotonic() - started
+                released.set()
+                await confluence
+                return elapsed
+
+        self.assertLess(asyncio.run(scenario()), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
