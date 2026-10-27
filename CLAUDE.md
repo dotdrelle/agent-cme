@@ -1,6 +1,6 @@
 # Repository Guide
 
-Current coordinated release: **0.16.58** (trust `_AGENT_VERSION` and the git tag, not this line). Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.16.65** (trust `_AGENT_VERSION` and the git tag, not this line). Keep `_AGENT_VERSION` aligned with
 the coordinated workspace stack.
 
 ## Goal
@@ -108,7 +108,7 @@ retry with a known `idempotencyKey` returns the existing job or result.
   each tool call.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.16.58`. Alignment is checked by
+  Current release line: `0.16.65`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - MCP tool descriptions, `_activity` metadata, status pages, progress labels,
